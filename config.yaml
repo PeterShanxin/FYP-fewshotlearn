@@ -1,0 +1,38 @@
+# Central configuration for the minimal FSL-EC project
+
+embedding:
+  model: esm2_t12_35M_UR50D  # ESM2-t12-35M (UR50D)
+
+# Device selection: "auto" → cuda if available else cpu
+device: auto
+
+# Episode settings
+episode:
+  M: 10              # ways
+  K_train: 5         # shots for training episodes
+  K_eval: [1, 5]     # shots for evaluation episodes
+  Q: 10              # queries per class
+
+# Number of episodes
+episodes:
+  train: 1000
+  val: 200
+
+# Embedding
+batch_size_embed: 4
+
+# ProtoNet head
+projection_dim: 256
+temperature: 10.0
+
+# Data filtering and splits
+min_sequences_per_class_for_train: 40  # classes with < this go to meta-test pool
+random_seed: 42
+
+# Paths
+paths:
+  data_root: data/uniprot_ec
+  joined_tsv: data/uniprot_ec/swissprot_ec_joined.tsv
+  embeddings: data/emb/embeddings.npz
+  splits_dir: data/splits
+  outputs: results

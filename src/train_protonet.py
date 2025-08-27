@@ -73,6 +73,11 @@ def main() -> None:
     device = pick_device(cfg)
     ensure_dirs(paths)
 
+    torch.manual_seed(cfg.get("random_seed", 42))
+    np.random.seed(cfg.get("random_seed", 42))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(cfg.get("random_seed", 42))
+
     # Samplers
     train_sampler = EpisodeSampler(paths["embeddings"], Path(paths["splits_dir"]) / "train.jsonl", device, seed=cfg.get("random_seed", 42))
     val_sampler   = EpisodeSampler(paths["embeddings"], Path(paths["splits_dir"]) / "val.jsonl", device, seed=cfg.get("random_seed", 42) + 1)

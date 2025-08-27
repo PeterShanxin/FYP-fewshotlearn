@@ -25,7 +25,7 @@ TMP_DIR.mkdir(parents=True, exist_ok=True)
 QUERY = 'reviewed:true AND (ec:*)'
 # NOTE: UniProt uses 'taxon_id' for taxonomy information (formerly 'taxonomy_id').
 # Field reference: https://www.uniprot.org/help/return_fields (for latest names).
-FIELDS = 'accession,ec,protein_name,taxon_id,organism_name,length'
+FIELDS = 'accession,ec,protein_name,organism_id,organism_name,length'  # 'taxon_id' renamed to 'organism_id' in UniProt API
 BASE = 'https://rest.uniprot.org/uniprotkb/stream'
 
 def _build_urls(query: str):
@@ -50,6 +50,11 @@ def _download(url: str, out_path: Path, label: str):
     Raises:
         The last exception if all retries fail.
     """
+    # We modify these globals only if we need to fall back to a simplified query
+    # after an HTTP 400; declare up-front to avoid Python treating them as locals
+    # after assignment inside the retry loop (which previously caused a
+    # SyntaxError due to use-before-declaration).
+    global TSV_URL, FASTA_URL, QUERY
     last_err = None
     for attempt in range(1, 4):
         try:
@@ -79,7 +84,6 @@ def _download(url: str, out_path: Path, label: str):
             if e.code == 400 and attempt == 1 and 'ec:*' in QUERY:
                 simple_query = 'reviewed:true AND ec:*'
                 print(f"[info] Trying simplified query variant: '{simple_query}'")
-                global TSV_URL, FASTA_URL, QUERY
                 QUERY = simple_query
                 TSV_URL, FASTA_URL = _build_urls(QUERY)
                 url = TSV_URL if 'tsv' in url else FASTA_URL
@@ -144,7 +148,7 @@ with TSV_FILE.open(newline='') as f:
 
 # Join TSV + FASTA
 print(f"[join] Joining TSV+FASTA by accession -> {JOINED_TSV}")
-joined_header = ['accession','ec','protein_name','taxon_id','organism_name','length','sequence']
+joined_header = ['accession','ec','protein_name','taxon_id','organism_name','length','sequence']  # keep legacy column name 'taxon_id' for downstream compatibility
 with JOINED_TSV.open('w', newline='') as f:
     w = csv.writer(f, delimiter='\t')
     w.writerow(joined_header)
@@ -155,7 +159,8 @@ with JOINED_TSV.open('w', newline='') as f:
             acc,
             ec,
             r.get('Protein names') or r.get('protein_name') or '',
-            r.get('Taxon ID') or r.get('taxon_id') or r.get('Taxonomic identifier') or '',
+            # Map possible taxonomy field names (old/new API variants)
+            r.get('Taxon ID') or r.get('taxon_id') or r.get('organism_id') or r.get('Taxonomic identifier') or '',
             r.get('Organism') or r.get('organism_name') or '',
             r.get('Length') or r.get('length') or '',
             acc2seq.get(acc, '')

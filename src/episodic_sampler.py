@@ -85,8 +85,8 @@ class EpisodeSampler:
             for a in q_acc:
                 query_x.append(self.emb_map[a])
                 query_y.append(label)
-        sx = torch.tensor(np.stack(support_x), dtype=torch.float32, device=self.device)
-        qx = torch.tensor(np.stack(query_x), dtype=torch.float32, device=self.device)
+        sx = torch.from_numpy(np.stack(support_x).astype(np.float32)).to(self.device)
+        qx = torch.from_numpy(np.stack(query_x).astype(np.float32)).to(self.device)
         sy = torch.tensor(support_y, dtype=torch.long, device=self.device)
         qy = torch.tensor(query_y, dtype=torch.long, device=self.device)
         return sx, sy, qx, qy

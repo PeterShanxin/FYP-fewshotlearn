@@ -18,6 +18,8 @@ pip install -r requirements.txt
 This pulls **reviewed** UniProtKB/Swiss‑Prot entries **with EC numbers**, saves TSV+FASTA, logs a snapshot (release date, URLs, SHA256), and produces a joined TSV.
 ```bash
 bash scripts/fetch_uniprot_ec.sh
+# or on Windows without WSL
+python scripts/fetch_uniprot_ec.py
 ```
 Outputs go to `data/uniprot_ec/`.
 

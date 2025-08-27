@@ -6,8 +6,14 @@ if "%CFG%"=="" set CFG=config.yaml
 
 echo [run_all] Using config: %CFG%
 
-:: 1) Fetch data (requires curl + Python on PATH)
-bash scripts/fetch_uniprot_ec.sh
+:: 1) Fetch data (auto-fallback to Python if Bash/WSL unavailable)
+bash -c "exit" >nul 2>&1
+if %errorlevel%==0 (
+  bash scripts/fetch_uniprot_ec.sh
+) else (
+  echo [run_all] Bash/WSL not found, using Python fetcher.
+  python scripts/fetch_uniprot_ec.py
+)
 if errorlevel 1 goto :error
 
 :: 2) Prepare splits

@@ -23,12 +23,9 @@ TMP_DIR.mkdir(parents=True, exist_ok=True)
 # UniProt's stream endpoint if certain characters are not encoded the way the
 # service expects (notably '*') or if there is transient routing / WAF filtering.
 QUERY = 'reviewed:true AND (ec:*)'
-# NOTE: 'taxonomy_id' is not a valid UniProt field name (current API uses 'taxon_id').
+# NOTE: UniProt uses 'taxon_id' for taxonomy information (formerly 'taxonomy_id').
 # Field reference: https://www.uniprot.org/help/return_fields (for latest names).
-# Removed taxonomy id field (taxon_id) because the stream endpoint currently
-# rejects it with HTTP 400. If taxonomy is required later, it can be parsed
-# from the full record or via separate taxonomy queries.
-FIELDS = 'accession,ec,protein_name,organism_name,length'
+FIELDS = 'accession,ec,protein_name,taxon_id,organism_name,length'
 BASE = 'https://rest.uniprot.org/uniprotkb/stream'
 
 def _build_urls(query: str):
@@ -146,7 +143,7 @@ with TSV_FILE.open(newline='') as f:
 
 # Join TSV + FASTA
 print(f"[join] Joining TSV+FASTA by accession -> {JOINED_TSV}")
-joined_header = ['accession','ec','protein_name','taxonomy_id','organism_name','length','sequence']
+joined_header = ['accession','ec','protein_name','taxon_id','organism_name','length','sequence']
 with JOINED_TSV.open('w', newline='') as f:
     w = csv.writer(f, delimiter='\t')
     w.writerow(joined_header)
@@ -157,7 +154,7 @@ with JOINED_TSV.open('w', newline='') as f:
             acc,
             ec,
             r.get('Protein names') or r.get('protein_name') or '',
-            r.get('Taxonomic identifier') or r.get('taxonomy_id') or '',
+            r.get('Taxon ID') or r.get('taxon_id') or r.get('Taxonomic identifier') or '',
             r.get('Organism') or r.get('organism_name') or '',
             r.get('Length') or r.get('length') or '',
             acc2seq.get(acc, '')

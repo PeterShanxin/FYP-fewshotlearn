@@ -19,7 +19,7 @@ mkdir -p "${DATA_ROOT}" "${TMP_DIR}"
 
 # --- Query & URLs ---
 QUERY="reviewed:true AND (ec:*)"
-FIELDS="accession,ec,protein_name,taxonomy_id,organism_name,length"
+FIELDS="accession,ec,protein_name,taxon_id,organism_name,length"
 BASE="https://rest.uniprot.org/uniprotkb/stream"
 TSV_URL="${BASE}?query=$(python - <<'PY'
 import urllib.parse
@@ -113,7 +113,7 @@ with open(fasta_acc_path) as f:
         acc2seq[acc] = seq
 # Prepare joined rows
 joined_header = [
-    'accession','ec','protein_name','taxonomy_id','organism_name','length','sequence'
+    'accession','ec','protein_name','taxon_id','organism_name','length','sequence'
 ]
 with open(out_joined, 'w', newline='') as f:
     w = csv.writer(f, delimiter='\t')
@@ -125,7 +125,7 @@ with open(out_joined, 'w', newline='') as f:
             acc,
             ec,
             r.get('Protein names') or r.get('protein_name') or '',
-            r.get('Taxonomic identifier') or r.get('taxonomy_id') or '',
+            r.get('Taxon ID') or r.get('taxon_id') or r.get('Taxonomic identifier') or '',
             r.get('Organism') or r.get('organism_name') or '',
             r.get('Length') or r.get('length') or '',
             acc2seq.get(acc,'')

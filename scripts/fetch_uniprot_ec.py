@@ -82,8 +82,9 @@ def _download(url: str, out_path: Path, label: str):
             if e.code == 400 and attempt == 1 and 'ec:*' in QUERY:
                 simple_query = 'reviewed:true AND ec:*'
                 print(f"[info] Trying simplified query variant: '{simple_query}'")
-                global TSV_URL, FASTA_URL
-                TSV_URL, FASTA_URL = _build_urls(simple_query)
+                global TSV_URL, FASTA_URL, QUERY
+                QUERY = simple_query
+                TSV_URL, FASTA_URL = _build_urls(QUERY)
                 url = TSV_URL if 'tsv' in url else FASTA_URL
             elif e.code in (429, 503):
                 # Backoff for rate limit or temporary service error

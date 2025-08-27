@@ -1,10 +1,10 @@
 import csv
 import hashlib
-import os
 from pathlib import Path
 from datetime import datetime, timezone
 import urllib.parse
 import urllib.request
+import urllib.error
 
 # Paths
 DATA_ROOT = Path('data/uniprot_ec')
@@ -19,28 +19,90 @@ DATA_ROOT.mkdir(parents=True, exist_ok=True)
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 
 # Query & URLs
+# Original broad query. Some users have reported sporadic HTTP 400 responses from
+# UniProt's stream endpoint if certain characters are not encoded the way the
+# service expects (notably '*') or if there is transient routing / WAF filtering.
 QUERY = 'reviewed:true AND (ec:*)'
-FIELDS = 'accession,ec,protein_name,taxonomy_id,organism_name,length'
+# NOTE: 'taxonomy_id' is not a valid UniProt field name (current API uses 'taxon_id').
+# Field reference: https://www.uniprot.org/help/return_fields (for latest names).
+# Removed taxonomy id field (taxon_id) because the stream endpoint currently
+# rejects it with HTTP 400. If taxonomy is required later, it can be parsed
+# from the full record or via separate taxonomy queries.
+FIELDS = 'accession,ec,protein_name,organism_name,length'
 BASE = 'https://rest.uniprot.org/uniprotkb/stream'
-encoded_query = urllib.parse.quote(QUERY)
-TSV_URL = f"{BASE}?query={encoded_query}&format=tsv&fields={FIELDS}"
-FASTA_URL = f"{BASE}?query={encoded_query}&format=fasta"
+
+def _build_urls(query: str):
+    # Encode with '*' escaped as well (safe='') to avoid edge cases.
+    encoded_query = urllib.parse.quote(query, safe='')
+    tsv_url = f"{BASE}?query={encoded_query}&format=tsv&fields={FIELDS}"
+    fasta_url = f"{BASE}?query={encoded_query}&format=fasta"
+    return tsv_url, fasta_url
+
+TSV_URL, FASTA_URL = _build_urls(QUERY)
 
 
-def _download(url: str, out_path: Path):
-    req = urllib.request.Request(url, headers={"User-Agent": "python-fetcher"})
-    with urllib.request.urlopen(req) as resp:
-        data = resp.read()
-        rel = resp.headers.get('X-UniProt-Release-Date', '')
-    out_path.write_bytes(data)
-    sha = hashlib.sha256(data).hexdigest()
-    return rel, sha
+def _download(url: str, out_path: Path, label: str):
+    """Download helper with retry & graceful fallback.
+
+    Args:
+        url: Full request URL.
+        out_path: Destination file path.
+        label: Short label for logging.
+    Returns:
+        (release_date_header, sha256_hex)
+    Raises:
+        The last exception if all retries fail.
+    """
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "fsl-ec-fetch/1.0 (+https://github.com/)",
+                "Accept": "*/*",
+            })
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = resp.read()
+                rel = resp.headers.get('X-UniProt-Release-Date', '')
+            out_path.write_bytes(data)
+            sha = hashlib.sha256(data).hexdigest()
+            if attempt > 1:
+                print(f"[retry] {label} succeeded on attempt {attempt}")
+            return rel, sha
+        except urllib.error.HTTPError as e:
+            body = ''
+            try:
+                body = e.read().decode('utf-8', 'ignore')[:500]
+            except Exception:
+                pass
+            print(f"[warn] HTTPError {e.code} for {label} attempt {attempt}: {e.reason}")
+            if body:
+                print(f"[warn] Body snippet: {body}")
+            last_err = e
+            # If 400, try a simplified query once (remove parentheses) then re-build URLs.
+            if e.code == 400 and attempt == 1 and 'ec:*' in QUERY:
+                simple_query = 'reviewed:true AND ec:*'
+                print(f"[info] Trying simplified query variant: '{simple_query}'")
+                global TSV_URL, FASTA_URL
+                TSV_URL, FASTA_URL = _build_urls(simple_query)
+                url = TSV_URL if 'tsv' in url else FASTA_URL
+            elif e.code in (429, 503):
+                # Backoff for rate limit or temporary service error
+                import time
+                time.sleep(5 * attempt)
+        except Exception as e:  # network, timeout, etc.
+            print(f"[warn] Error for {label} attempt {attempt}: {e}")
+            last_err = e
+    # All retries exhausted
+    raise last_err  # type: ignore
 
 
+print(f"[fetch] Query: {QUERY}")
+print(f"[fetch] TSV URL   : {TSV_URL}")
+print(f"[fetch] FASTA URL : {FASTA_URL}")
 print(f"[fetch] Downloading TSV -> {TSV_FILE}")
-TSV_REL, TSV_SHA = _download(TSV_URL, TSV_FILE)
+TSV_REL, TSV_SHA = _download(TSV_URL, TSV_FILE, 'TSV')
 print(f"[fetch] Downloading FASTA -> {FASTA_FILE}")
-FASTA_REL, FASTA_SHA = _download(FASTA_URL, FASTA_FILE)
+FASTA_REL, FASTA_SHA = _download(FASTA_URL, FASTA_FILE, 'FASTA')
 
 # Snapshot log
 snapshot_lines = [

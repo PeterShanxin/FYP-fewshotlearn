@@ -46,7 +46,9 @@ def filter_single_ec(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     # normalise column names
     df.columns = [c.lower() for c in df.columns]
-    df = df[("ec" in df.columns) & (df["ec"].notna())]
+    if "ec" not in df.columns:
+        raise KeyError("'ec' column not found")
+    df = df[df["ec"].notna()]
     df = df[(df["ec"].notna()) & (df["ec"].astype(str).str.len() > 0)]
     # keep only single-EC rows (no ';')
     mask_single = ~df["ec"].astype(str).str.contains(";")

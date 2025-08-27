@@ -65,6 +65,18 @@ class EpisodeSampler:
         return classes[:M]
 
     def sample_episode(self, M: int, K: int, Q: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sample a single episode.
+
+        Args:
+            M: Number of classes.
+            K: Number of support samples per class. Must be positive.
+            Q: Number of query samples per class. Must be positive.
+
+        Raises:
+            ValueError: If ``K`` or ``Q`` is not a positive integer.
+        """
+        if K <= 0 or Q <= 0:
+            raise ValueError("K and Q must be positive integers")
         classes = self._pick_classes(M)
         support_x, support_y, query_x, query_y = [], [], [], []
         for label, ec in enumerate(classes):

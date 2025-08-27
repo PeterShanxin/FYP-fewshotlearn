@@ -39,7 +39,7 @@ def eval_for_K(model: ProtoNet, sampler: EpisodeSampler, M: int, K: int, Q: int,
             ys.extend(qy.cpu().numpy().tolist())
             yh.extend(pred.cpu().numpy().tolist())
     acc = accuracy_score(ys, yh)
-    f1 = f1_score(ys, yh, average="macro")
+    f1 = f1_score(ys, yh, average="macro", zero_division=0)
     return {"acc": float(acc), "macro_f1": float(f1)}
 
 

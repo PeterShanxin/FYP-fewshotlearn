@@ -10,6 +10,7 @@ import argparse
 import json
 from pathlib import Path
 from typing import Dict
+from contextlib import contextmanager
 
 import numpy as np
 import torch
@@ -37,16 +38,28 @@ def ensure_dirs(paths: Dict[str, str]) -> None:
     Path(paths["embeddings"]).parent.mkdir(parents=True, exist_ok=True)
 
 
-def episodic_accuracy(model: ProtoNet, val_sampler: EpisodeSampler, M: int, K: int, Q: int, episodes: int) -> float:
+@contextmanager
+def evaluating(model: ProtoNet):
+    """Temporarily set the model to eval mode."""
+    was_training = model.training
     model.eval()
+    try:
+        yield
+    finally:
+        if was_training:
+            model.train()
+
+
+def episodic_accuracy(model: ProtoNet, val_sampler: EpisodeSampler, M: int, K: int, Q: int, episodes: int) -> float:
     correct = 0
     total = 0
     with torch.no_grad():
-        for _ in range(episodes):
-            sx, sy, qx, qy = val_sampler.sample_episode(M, K, Q)
-            pred = model.predict(sx, sy, qx)
-            correct += int((pred == qy).sum().item())
-            total += int(qy.numel())
+        with evaluating(model):
+            for _ in range(episodes):
+                sx, sy, qx, qy = val_sampler.sample_episode(M, K, Q)
+                pred = model.predict(sx, sy, qx)
+                correct += int((pred == qy).sum().item())
+                total += int(qy.numel())
     return correct / max(total, 1)
 
 

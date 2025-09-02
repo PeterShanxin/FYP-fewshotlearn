@@ -19,7 +19,8 @@ mkdir -p "${DATA_ROOT}" "${TMP_DIR}"
 
 # --- Query & URLs ---
 QUERY="reviewed:true AND (ec:*)"
-FIELDS="accession,ec,protein_name,taxon_id,organism_name,length"
+# UniProt 2025 field names: 'taxon_id' is not valid; use 'organism_id'
+FIELDS="accession,ec,protein_name,organism_id,organism_name,length"
 BASE="https://rest.uniprot.org/uniprotkb/stream"
 TSV_URL="${BASE}?query=$(python - <<'PY'
 import urllib.parse
@@ -121,15 +122,16 @@ with open(out_joined, 'w', newline='') as f:
     for r in rows:
         acc = r.get('Accession') or r.get('accession') or r.get('Entry')
         ec  = r.get('EC number') or r.get('ec') or ''
-        rec = [
-            acc,
-            ec,
-            r.get('Protein names') or r.get('protein_name') or '',
-            r.get('Taxon ID') or r.get('taxon_id') or r.get('Taxonomic identifier') or '',
-            r.get('Organism') or r.get('organism_name') or '',
-            r.get('Length') or r.get('length') or '',
-            acc2seq.get(acc,'')
-        ]
+    rec = [
+      acc,
+      ec,
+      r.get('Protein names') or r.get('protein_name') or '',
+      # Map possible taxonomy field names (legacy + current API)
+      r.get('Taxon ID') or r.get('taxon_id') or r.get('organism_id') or r.get('Taxonomic identifier') or '',
+      r.get('Organism') or r.get('organism_name') or '',
+      r.get('Length') or r.get('length') or '',
+      acc2seq.get(acc,'')
+    ]
         if acc and rec[-1]:
             w.writerow(rec)
 # Optional long format by EC levels if easy

@@ -98,6 +98,8 @@ def _download(url: str, out_path: Path, label: str):
     raise last_err  # type: ignore
 
 
+from tqdm import tqdm
+
 print(f"[fetch] Query: {QUERY}")
 print(f"[fetch] TSV URL   : {TSV_URL}")
 print(f"[fetch] FASTA URL : {FASTA_URL}")
@@ -105,6 +107,16 @@ print(f"[fetch] Downloading TSV -> {TSV_FILE}")
 TSV_REL, TSV_SHA = _download(TSV_URL, TSV_FILE, 'TSV')
 print(f"[fetch] Downloading FASTA -> {FASTA_FILE}")
 FASTA_REL, FASTA_SHA = _download(FASTA_URL, FASTA_FILE, 'FASTA')
+
+# Progress bar for join steps
+steps = [
+    "Parse FASTA headers",
+    "Read TSV",
+    "Join TSV+FASTA",
+    "Write long format",
+    "Write snapshot meta"
+]
+pbar = tqdm(total=len(steps), desc="[dataFetch]", ncols=80)
 
 # Snapshot log
 snapshot_lines = [
@@ -121,6 +133,7 @@ snapshot_lines = [
 for line in snapshot_lines:
     print(line)
 SNAPSHOT_META.write_text("\n".join(snapshot_lines) + "\n", encoding='utf-8')
+
 
 # Parse FASTA
 print("[join] Parsing FASTA headers…")
@@ -139,12 +152,16 @@ for line in FASTA_FILE.read_text().splitlines():
         seq_lines.append(line)
 if acc and seq_lines:
     acc2seq[acc] = ''.join(seq_lines)
+pbar.update(1)
+
 
 # Read TSV
 rows = []
 with TSV_FILE.open(newline='') as f:
     reader = csv.DictReader(f, delimiter='\t')
     rows.extend(reader)
+pbar.update(1)
+
 
 # Join TSV + FASTA
 print(f"[join] Joining TSV+FASTA by accession -> {JOINED_TSV}")
@@ -167,6 +184,8 @@ with JOINED_TSV.open('w', newline='') as f:
         ]
         if acc and rec[-1]:
             w.writerow(rec)
+pbar.update(1)
+
 
 # Optional long format
 with LONG_TSV.open('w', newline='') as f:
@@ -182,7 +201,11 @@ with LONG_TSV.open('w', newline='') as f:
             parts += [''] * (4 - len(parts))
             ec1, ec2, ec3, ec4 = parts[:4]
             w.writerow([acc, ec_item, ec1, ec2, ec3, ec4])
+pbar.update(1)
 
+
+pbar.update(1)
+pbar.close()
 print('[done]')
 print(f'[ok] Snapshot written to {SNAPSHOT_META}')
 print(f'[ok] Joined table -> {JOINED_TSV}')

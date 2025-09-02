@@ -51,11 +51,12 @@ def evaluating(model: ProtoNet):
 
 
 def episodic_accuracy(model: ProtoNet, val_sampler: EpisodeSampler, M: int, K: int, Q: int, episodes: int) -> float:
+    from tqdm import trange
     correct = 0
     total = 0
     with torch.no_grad():
         with evaluating(model):
-            for _ in range(episodes):
+            for _ in trange(episodes, desc="[val] episodes", leave=False, ncols=80):
                 sx, sy, qx, qy = val_sampler.sample_episode(M, K, Q)
                 pred = model.predict(sx, sy, qx)
                 correct += int((pred == qy).sum().item())
@@ -108,7 +109,7 @@ def main() -> None:
     eval_every = max(50, n_train // 10)
 
     model.train()
-    for ep in trange(n_train, desc="episodes"):
+    for ep in trange(n_train, desc="episodes", ncols=80):
         sx, sy, qx, qy = train_sampler.sample_episode(M, K, Q)
         logits, loss = model(sx, sy, qx, qy)
         opt.zero_grad()
@@ -124,6 +125,7 @@ def main() -> None:
                 best_acc = acc
                 best_state = {"model": model.state_dict()}
                 checks_without_improve = 0
+                print(f"[train] best_val_acc improved to {best_acc:.4f} | checkpoint will be saved")
             else:
                 checks_without_improve += 1
             if checks_without_improve >= patience_checks:

@@ -2,6 +2,7 @@
 
 embedding:
   model: esm2_t12_35M_UR50D  # ESM2-t12-35M (UR50D)
+  # limit removed for full run (set 'limit: 1000' temporarily for smoke tests)
 
 # Device selection: "auto" → cuda if available else cpu
 device: auto
@@ -19,7 +20,7 @@ episodes:
   val: 200
 
 # Embedding
-batch_size_embed: 4
+batch_size_embed: 64  # tuned as per GPU; adjust if OOM
 
 # ProtoNet head
 projection_dim: 256

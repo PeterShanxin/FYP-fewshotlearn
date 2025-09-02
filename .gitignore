@@ -1,2 +1,6 @@
 /data/uniprot_ec
-data/emb/embeddings.npz
+data/emb/
+.venv/*
+__pycache__/
+*.pyc
+results/checkpoints/

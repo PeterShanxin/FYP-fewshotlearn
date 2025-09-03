@@ -20,7 +20,17 @@ episodes:
   val: 200
 
 # Embedding
-batch_size_embed: 64  # tuned as per GPU; adjust if OOM
+batch_size_embed: 64  # raise to 128–512 on A40 (use config.hpc.yaml)
+max_seq_len: 1022     # full ESM2 context window
+fp16: true            # enable FP16 inference on GPU
+dynamic_batch: true   # reduce batch size automatically on OOM
+progress: true
+verbose: false
+
+# Training knobs
+fp16_train: false           # AMP for ProtoNet head (usually not needed)
+eval_every: 100             # episodes between validations (auto if unset)
+episodes_per_val_check: 50  # validation episodes per check
 
 # ProtoNet head
 projection_dim: 256

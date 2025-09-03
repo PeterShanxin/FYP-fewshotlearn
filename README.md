@@ -82,6 +82,27 @@ Paths (relative):
 
 ---
 
+## HPC Profile (A40 48GB)
+- Use `config.hpc.yaml` to leverage a single NVIDIA A40 (48GB) and a multi-core CPU.
+- Key changes vs. default:
+  - ESM model: `esm2_t33_650M_UR50D` (larger, better quality)
+  - Embedding: `batch_size_embed=512`, `fp16: true`, `max_seq_len: 1022`, `dynamic_batch: true`
+  - Episodes: `train=10000`, `val=2000`, `eval=5000` for tighter confidence intervals
+  - Device: `auto` (uses CUDA when available)
+  - Training knobs: `eval_every=1000`, `episodes_per_val_check=200` (control validation cadence and variance)
+
+Run the full pipeline with the HPC config:
+```
+bash scripts/run_all.sh config.hpc.yaml
+```
+
+Notes:
+- If you switch to very large ESM models, 48GB may not hold `3B` model at high batch sizes. Start high (e.g., 512) and let `dynamic_batch: true` reduce as needed; you can also lower to 128–256 manually.
+- Confidence interval tightening comes from increasing episode count: for episodic accuracy over N total queries, the standard error shrinks ~ O(1/sqrt(N)). Raising `episodes.val` and `episodes.eval` reduces variance.
+- Precision:
+  - Embedding runs in FP16 on GPU for throughput; full `max_seq_len=1022`.
+  - ProtoNet training remains FP32 by default (`fp16_train: false`) as the head is small; AMP brings minimal gains for this model.
+
 ## Expected runtime (ballpark)
 - **CPU (laptop 4–8 cores)**: fetch ~5–10 min; embed a few thousand seqs at ~5–15 seq/s; training 1k episodes ~10–30 min.
 - **Small GPU (e.g., RTX 3060/4070)**: embedding 100–300 seq/s; training 1k episodes ~3–10 min.

@@ -101,12 +101,17 @@ def main() -> None:
     pcfg = ProtoConfig(input_dim=train_sampler.dim, projection_dim=int(cfg.get("projection_dim", 256)), temperature=float(cfg.get("temperature", 10.0)))
     model = ProtoNet(pcfg).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    use_amp = bool(cfg.get("fp16_train", False)) and device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     M = int(cfg["episode"]["M"])
     K = int(cfg["episode"]["K_train"])
     Q = int(cfg["episode"]["Q"])
     n_train = int(cfg["episodes"]["train"])
     n_val_eval = max(1, int(cfg["episodes"]["val"]))
+    # Validation cadence and size knobs
+    eval_every = int(cfg.get("eval_every", max(50, n_train // 10)))
+    episodes_per_val_check = int(cfg.get("episodes_per_val_check", 50))
 
     show_progress = bool(cfg.get("progress", True))
     verbose = bool(cfg.get("verbose", show_progress))
@@ -115,7 +120,10 @@ def main() -> None:
     print(json.dumps({
         "device": str(device), "M": M, "K_train": K, "Q": Q, "episodes_train": n_train,
         "projection_dim": int(cfg.get("projection_dim", 256)),
-        "temperature": float(cfg.get("temperature", 10.0))
+        "temperature": float(cfg.get("temperature", 10.0)),
+        "fp16_train": use_amp,
+        "eval_every": eval_every,
+        "episodes_per_val_check": episodes_per_val_check,
     }, indent=2))
 
     best_acc = -1.0
@@ -123,7 +131,6 @@ def main() -> None:
     history = {"val_acc": [], "checkpoints_after_episode": []}
     patience_checks = 10
     checks_without_improve = 0
-    eval_every = max(50, n_train // 10)
 
     model.train()
     pbar = tqdm(
@@ -131,14 +138,22 @@ def main() -> None:
     )
     for ep in pbar:
         sx, sy, qx, qy = train_sampler.sample_episode(M, K, Q)
-        logits, loss = model(sx, sy, qx, qy)
-        opt.zero_grad()
-        loss.backward()
-        opt.step()
+        if use_amp:
+            with torch.cuda.amp.autocast(dtype=torch.float16):
+                logits, loss = model(sx, sy, qx, qy)
+            opt.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+        else:
+            logits, loss = model(sx, sy, qx, qy)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
 
         if (ep + 1) % eval_every == 0 or ep == n_train - 1:
             acc = episodic_accuracy(
-                model, val_sampler, M, K, Q, episodes=min(50, n_val_eval), show_progress=show_progress
+                model, val_sampler, M, K, Q, episodes=min(episodes_per_val_check, n_val_eval), show_progress=show_progress
             )
             history["val_acc"].append(acc)
             history["checkpoints_after_episode"].append(ep + 1)

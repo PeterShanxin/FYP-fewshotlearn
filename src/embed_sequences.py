@@ -77,6 +77,8 @@ def main() -> None:
         "model": cfg["embedding"]["model"],
         "device": str(device),
         "batch_size": bs,
+        "fp16": bool(use_fp16),
+        "max_seq_len": max_seq_len,
         "joined_tsv": paths["joined_tsv"],
         "out_npz": paths["embeddings"],
     }

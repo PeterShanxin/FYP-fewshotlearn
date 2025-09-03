@@ -1,0 +1,51 @@
+# High-throughput, single-GPU (A40 48GB) configuration
+
+embedding:
+  # Larger ESM2 backbone for better representations
+  # Options: esm2_t33_650M_UR50D, esm2_t36_3B_UR50D (3B likely too large for 48GB)
+  model: esm2_t33_650M_UR50D
+
+# Device selection: "auto" → cuda if available else cpu
+device: auto
+
+# Episode settings (few-shot task shape)
+episode:
+  M: 10              # ways
+  K_train: 5         # shots for training episodes
+  K_eval: [1, 5]     # shots evaluated on test episodes
+  Q: 10              # queries per class
+
+# Episode counts (raise for tighter confidence intervals)
+episodes:
+  train: 10000       # 5k–20k recommended; start with 10k
+  val: 2000          # increase validation episodes
+  eval: 5000         # meta-test episodes for tight CIs
+
+# Embedding runtime knobs (optimize throughput)
+batch_size_embed: 512    # start high; dynamic_batch will adapt on OOM
+max_seq_len: 1022        # full ESM2 context window
+fp16: true               # use FP16 inference on GPU
+dynamic_batch: true      # auto-reduce batch on OOM
+progress: true
+verbose: false
+
+# ProtoNet head
+projection_dim: 256
+temperature: 10.0
+
+# Training knobs
+fp16_train: false            # AMP for ProtoNet head (gains minimal; keep FP32)
+eval_every: 1000             # validate every 1k episodes (10 checks across 10k)
+episodes_per_val_check: 200  # 200-episode validation slices (faster interim CIs)
+
+# Data filtering and splits
+min_sequences_per_class_for_train: 40
+random_seed: 42
+
+# Paths
+paths:
+  data_root: data/uniprot_ec
+  joined_tsv: data/uniprot_ec/swissprot_ec_joined.tsv
+  embeddings: data/emb/embeddings.npz
+  splits_dir: data/splits
+  outputs: results

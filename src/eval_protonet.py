@@ -67,7 +67,9 @@ def main() -> None:
 
     M = int(cfg["episode"]["M"])
     Q = int(cfg["episode"]["Q"])
-    n_eval = max(100, int(cfg["episodes"]["val"]))  # run a bit more for test
+    # Allow separate eval episodes; fallback to 'val' if unspecified
+    episodes_cfg = cfg.get("episodes", {})
+    n_eval = int(episodes_cfg.get("eval", max(100, int(episodes_cfg.get("val", 200)))))
 
     results: Dict[str, Dict[str, float]] = {}
     for K in cfg["episode"]["K_eval"]:

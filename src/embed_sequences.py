@@ -72,18 +72,14 @@ def main() -> None:
     show_progress = bool(cfg.get("progress", True))
 
     print("[embed] config:")
-    print(
-        json.dumps(
-            dict(
-                model=cfg["embedding"]["model"],
-                device=str(device),
-                batch_size=bs,
-                joined_tsv=paths["joined_tsv"],
-                out_npz=paths["embeddings"],
-            ),
-            indent=2,
-        )
-    )
+    cfg_display = {
+        "model": cfg["embedding"]["model"],
+        "device": str(device),
+        "batch_size": bs,
+        "joined_tsv": paths["joined_tsv"],
+        "out_npz": paths["embeddings"],
+    }
+    print(json.dumps(cfg_display, indent=2))
 
     # Collect accession set from splits
     accs_needed = read_splits(Path(paths["splits_dir"]))

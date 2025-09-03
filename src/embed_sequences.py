@@ -70,6 +70,7 @@ def main() -> None:
     use_fp16 = bool(cfg.get("fp16", True)) and torch.cuda.is_available()
     dynamic_batch = bool(cfg.get("dynamic_batch", True))
     show_progress = bool(cfg.get("progress", True))
+    verbose = bool(cfg.get("verbose", show_progress))
 
     print("[embed] config:")
     print(
@@ -152,9 +153,11 @@ def main() -> None:
     if use_fp16 and device.type == "cuda":
         try:
             model.half()
-            print("[embed] using FP16 inference")
+            if verbose:
+                print("[embed] using FP16 inference")
         except Exception:
-            print("[embed] FP16 conversion failed; continuing in FP32")
+            if verbose:
+                print("[embed] FP16 conversion failed; continuing in FP32")
     batch_converter = alphabet.get_batch_converter()
 
     out: Dict[str, np.ndarray] = {}

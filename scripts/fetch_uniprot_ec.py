@@ -5,6 +5,33 @@ from datetime import datetime, timezone
 import urllib.parse
 import urllib.request
 import urllib.error
+import argparse
+
+from tqdm import tqdm
+
+# ---------------------------------------------------------------------------
+# CLI / logging helpers
+parser = argparse.ArgumentParser(description="Fetch UniProt EC entries")
+parser.add_argument("--verbose", dest="verbose", action="store_true", default=True,
+                    help="Enable verbose output")
+parser.add_argument("--no-verbose", dest="verbose", action="store_false",
+                    help="Disable verbose output")
+parser.add_argument("--progress", dest="show_progress", action="store_true",
+                    default=True, help="Show progress bar")
+parser.add_argument("--no-progress", dest="show_progress", action="store_false",
+                    help="Disable progress bar")
+args = parser.parse_args()
+
+VERBOSE = args.verbose
+SHOW_PROGRESS = args.show_progress
+
+
+def log(msg: str):
+    if VERBOSE:
+        if SHOW_PROGRESS:
+            tqdm.write(msg)
+        else:
+            print(msg)
 
 # Paths
 DATA_ROOT = Path('data/uniprot_ec')
@@ -68,7 +95,7 @@ def _download(url: str, out_path: Path, label: str):
             out_path.write_bytes(data)
             sha = hashlib.sha256(data).hexdigest()
             if attempt > 1:
-                print(f"[retry] {label} succeeded on attempt {attempt}")
+                log(f"[retry] {label} succeeded on attempt {attempt}")
             return rel, sha
         except urllib.error.HTTPError as e:
             body = ''
@@ -76,14 +103,14 @@ def _download(url: str, out_path: Path, label: str):
                 body = e.read().decode('utf-8', 'ignore')[:500]
             except Exception:
                 pass
-            print(f"[warn] HTTPError {e.code} for {label} attempt {attempt}: {e.reason}")
+            log(f"[warn] HTTPError {e.code} for {label} attempt {attempt}: {e.reason}")
             if body:
-                print(f"[warn] Body snippet: {body}")
+                log(f"[warn] Body snippet: {body}")
             last_err = e
             # If 400, try a simplified query once (remove parentheses) then re-build URLs.
             if e.code == 400 and attempt == 1 and 'ec:*' in QUERY:
                 simple_query = 'reviewed:true AND ec:*'
-                print(f"[info] Trying simplified query variant: '{simple_query}'")
+                log(f"[info] Trying simplified query variant: '{simple_query}'")
                 QUERY = simple_query
                 TSV_URL, FASTA_URL = _build_urls(QUERY)
                 url = TSV_URL if 'tsv' in url else FASTA_URL
@@ -92,20 +119,18 @@ def _download(url: str, out_path: Path, label: str):
                 import time
                 time.sleep(5 * attempt)
         except Exception as e:  # network, timeout, etc.
-            print(f"[warn] Error for {label} attempt {attempt}: {e}")
+            log(f"[warn] Error for {label} attempt {attempt}: {e}")
             last_err = e
     # All retries exhausted
     raise last_err  # type: ignore
 
 
-from tqdm import tqdm
-
-print(f"[fetch] Query: {QUERY}")
-print(f"[fetch] TSV URL   : {TSV_URL}")
-print(f"[fetch] FASTA URL : {FASTA_URL}")
-print(f"[fetch] Downloading TSV -> {TSV_FILE}")
+log(f"[fetch] Query: {QUERY}")
+log(f"[fetch] TSV URL   : {TSV_URL}")
+log(f"[fetch] FASTA URL : {FASTA_URL}")
+log(f"[fetch] Downloading TSV -> {TSV_FILE}")
 TSV_REL, TSV_SHA = _download(TSV_URL, TSV_FILE, 'TSV')
-print(f"[fetch] Downloading FASTA -> {FASTA_FILE}")
+log(f"[fetch] Downloading FASTA -> {FASTA_FILE}")
 FASTA_REL, FASTA_SHA = _download(FASTA_URL, FASTA_FILE, 'FASTA')
 
 # Progress bar for join steps
@@ -116,7 +141,7 @@ steps = [
     "Write long format",
     "Write snapshot meta"
 ]
-pbar = tqdm(total=len(steps), desc="[dataFetch]", ncols=80)
+pbar = tqdm(total=len(steps), desc="[dataFetch]", ncols=80, disable=not SHOW_PROGRESS)
 
 # Snapshot log
 snapshot_lines = [
@@ -131,12 +156,12 @@ snapshot_lines = [
     f"SHA256(FASTA): {FASTA_SHA}  {FASTA_FILE.name}",
 ]
 for line in snapshot_lines:
-    print(line)
+    log(line)
 SNAPSHOT_META.write_text("\n".join(snapshot_lines) + "\n", encoding='utf-8')
 
 
 # Parse FASTA
-print("[join] Parsing FASTA headers…")
+log("[join] Parsing FASTA headers…")
 acc2seq = {}
 acc = None
 seq_lines = []
@@ -164,7 +189,7 @@ pbar.update(1)
 
 
 # Join TSV + FASTA
-print(f"[join] Joining TSV+FASTA by accession -> {JOINED_TSV}")
+log(f"[join] Joining TSV+FASTA by accession -> {JOINED_TSV}")
 joined_header = ['accession','ec','protein_name','taxon_id','organism_name','length','sequence']  # keep legacy column name 'taxon_id' for downstream compatibility
 with JOINED_TSV.open('w', newline='') as f:
     w = csv.writer(f, delimiter='\t')
@@ -206,6 +231,6 @@ pbar.update(1)
 
 pbar.update(1)
 pbar.close()
-print('[done]')
-print(f'[ok] Snapshot written to {SNAPSHOT_META}')
-print(f'[ok] Joined table -> {JOINED_TSV}')
+log('[done]')
+log(f'[ok] Snapshot written to {SNAPSHOT_META}')
+log(f'[ok] Joined table -> {JOINED_TSV}')

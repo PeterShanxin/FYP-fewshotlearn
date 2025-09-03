@@ -44,13 +44,13 @@ echo "[run_all] Using config: ${CFG}"
 
 # Respect gpus from config by setting CUDA_VISIBLE_DEVICES if not already set
 if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
-  GPUS=$(python - <<PY
+  GPUS=$(python - "${CFG}" <<'PY'
 import sys, yaml
 with open(sys.argv[1], 'r') as f:
     cfg = yaml.safe_load(f)
 print(int(cfg.get('gpus', 1)))
 PY
-"${CFG}")
+)
   if [ "$GPUS" -gt 0 ]; then
     # Build a device list like 0 or 0,1
     LIST=$(python - <<PY

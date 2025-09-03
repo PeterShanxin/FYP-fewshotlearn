@@ -1,6 +1,42 @@
-/data/uniprot_ec
+# Project data (fetched/derived)
+data/uniprot_ec/
+data/uniprot_ec_*/
 data/emb/
-.venv/*
+data/splits/
+data/splits_*/
+data/**/_tmp/
+
+# Results (training/eval outputs)
+results/
+
+# Python: bytecode, caches, coverage, packaging
 __pycache__/
-*.pyc
-results/checkpoints/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.cache/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+coverage.xml
+htmlcov/
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Virtual envs
+.venv/
+venv/
+env/
+.python-version
+
+# IDE / OS
+.vscode/
+.idea/
+*.code-workspace
+.DS_Store
+Thumbs.db
+.ipynb_checkpoints/

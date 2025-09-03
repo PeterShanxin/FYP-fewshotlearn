@@ -86,6 +86,7 @@ def main() -> None:
     cfg = load_cfg(args.config)
     paths = cfg["paths"]
     device = pick_device(cfg)
+    requested_gpus = int(cfg.get("gpus", 1))
     ensure_dirs(paths)
 
     torch.manual_seed(cfg.get("random_seed", 42))
@@ -118,13 +119,15 @@ def main() -> None:
 
     print("[train] config:")
     print(json.dumps({
-        "device": str(device), "M": M, "K_train": K, "Q": Q, "episodes_train": n_train,
+        "device": str(device), "gpus_requested": requested_gpus, "M": M, "K_train": K, "Q": Q, "episodes_train": n_train,
         "projection_dim": int(cfg.get("projection_dim", 256)),
         "temperature": float(cfg.get("temperature", 10.0)),
         "fp16_train": use_amp,
         "eval_every": eval_every,
         "episodes_per_val_check": episodes_per_val_check,
     }, indent=2))
+    if requested_gpus > 1 and device.type == "cuda":
+        print("[train] Note: training runs on a single GPU; multi-GPU is used for embeddings only.")
 
     best_acc = -1.0
     best_state = None

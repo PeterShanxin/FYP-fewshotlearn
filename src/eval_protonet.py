@@ -51,11 +51,14 @@ def main() -> None:
     cfg = load_cfg(args.config)
     paths = cfg["paths"]
     device = pick_device(cfg)
+    requested_gpus = int(cfg.get("gpus", 1))
 
     # Sampler and model init
     test_sampler = EpisodeSampler(paths["embeddings"], Path(paths["splits_dir"]) / "test.jsonl", device, seed=cfg.get("random_seed", 42) + 2)
     pcfg = ProtoConfig(input_dim=test_sampler.dim, projection_dim=int(cfg.get("projection_dim", 256)), temperature=float(cfg.get("temperature", 10.0)))
     model = ProtoNet(pcfg).to(device)
+    if requested_gpus > 1 and device.type == "cuda":
+        print("[eval] Note: evaluation runs on a single GPU; multi-GPU is used for embeddings only.")
 
     # Load checkpoint
     ckpt_path = Path(paths["outputs"]) / "checkpoints" / "protonet.pt"

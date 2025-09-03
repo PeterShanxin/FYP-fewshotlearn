@@ -1,4 +1,9 @@
-# High-throughput, single-GPU (A40 48GB) configuration
+# High-throughput, multi-GPU (A40 48GB) configuration
+
+# Number of GPUs to use when available (embedding step is multi-GPU aware).
+# Training/eval of ProtoNet remain single-GPU as they operate on episodic batches
+# with support/query coupling that doesn't trivially shard.
+gpus: 2
 
 embedding:
   # Larger ESM2 backbone for better representations
@@ -22,7 +27,7 @@ episodes:
   eval: 5000         # meta-test episodes for tight CIs
 
 # Embedding runtime knobs (optimize throughput)
-batch_size_embed: 512    # start high; dynamic_batch will adapt on OOM
+batch_size_embed: 1536   # 2x A40 with FP16+DP; dynamic_batch adapts on OOM
 max_seq_len: 1022        # full ESM2 context window
 fp16: true               # use FP16 inference on GPU
 dynamic_batch: true      # auto-reduce batch on OOM

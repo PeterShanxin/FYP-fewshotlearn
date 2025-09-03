@@ -17,6 +17,7 @@ import pandas as pd
 import torch
 import yaml
 from tqdm import tqdm
+import torch.nn as nn
 
 
 def load_config(path: str) -> dict:
@@ -65,6 +66,8 @@ def main() -> None:
     cfg = load_config(args.config)
     paths = cfg["paths"]
     device = pick_device(cfg)
+    # Multi-GPU toggle (used for embedding only)
+    requested_gpus = int(cfg.get("gpus", 1))
     bs = int(cfg.get("batch_size_embed", 4))
     max_seq_len = int(cfg.get("max_seq_len", 1022))  # ESM2 context limit
     use_fp16 = bool(cfg.get("fp16", True)) and torch.cuda.is_available()
@@ -147,29 +150,62 @@ def main() -> None:
         alphabet = _Alphabet()
         print("[embed] WARNING: Using fallback ESM2 construction without pretrained weights (random init). Install fair-esm for real embeddings.")
     model.eval()
-    model.to(device)
-    if use_fp16 and device.type == "cuda":
-        try:
-            model.half()
+    # Prepare device(s)
+    multi_gpu = (device.type == "cuda" and torch.cuda.device_count() > 1 and requested_gpus > 1)
+    if device.type == "cuda":
+        # Anchor on cuda:0 and (optionally) wrap with DataParallel
+        primary = torch.device("cuda:0")
+        model.to(primary)
+        # AMP: use half precision for forward if enabled
+        if use_fp16:
+            try:
+                model.half()
+                if verbose:
+                    print("[embed] using FP16 inference")
+            except Exception:
+                if verbose:
+                    print("[embed] FP16 conversion failed; continuing in FP32")
+        if multi_gpu:
+            max_gpus = min(requested_gpus, torch.cuda.device_count())
+            device_ids = list(range(max_gpus))
+            model = nn.DataParallel(model, device_ids=device_ids, output_device=device_ids[0])
             if verbose:
-                print("[embed] using FP16 inference")
-        except Exception:
-            if verbose:
-                print("[embed] FP16 conversion failed; continuing in FP32")
+                print(f"[embed] DataParallel enabled on GPUs: {device_ids}")
+        # Keep tokens on cuda:0; DataParallel scatters to other GPUs
+        device = primary
+    else:
+        model.to(device)
+    # Report GPU usage to terminal immediately after loading
+    if device.type == "cuda":
+        if multi_gpu:
+            used_ids = device_ids  # type: ignore[name-defined]
+            gcount = len(used_ids)
+            glist = ",".join(f"cuda:{i}" for i in used_ids)
+        else:
+            gcount = 1
+            glist = "cuda:0"
+        print(f"[embed] using {gcount} GPU(s): {glist}", flush=True)
+    else:
+        print("[embed] using 0 GPU(s) (CPU)", flush=True)
     batch_converter = alphabet.get_batch_converter()
 
     out: Dict[str, np.ndarray] = {}
     def _embed_batch(batch_list, current_bs):
         data = [(name, seq) for name, seq in batch_list]
         _, _, tokens = batch_converter(data)
-        tokens = tokens.to(device)
+        if device.type == "cuda":
+            tokens = tokens.pin_memory().to(device, non_blocking=True)
+        else:
+            tokens = tokens.to(device)
         autocast_ctx = (
             torch.amp.autocast("cuda", dtype=torch.float16)
             if use_fp16 and device.type == "cuda"
             else torch.amp.autocast("cuda", enabled=False)
         )
+        # Determine num_layers for both bare model and DataParallel wrapper
+        num_layers = getattr(getattr(model, 'module', model), 'num_layers')
         with autocast_ctx:
-            reps = model(tokens, repr_layers=[model.num_layers], return_contacts=False)["representations"][model.num_layers]
+            reps = model(tokens, repr_layers=[num_layers], return_contacts=False)["representations"][num_layers]
         for i, (name, _seq) in enumerate(batch_list):
             tok = tokens[i]
             rep = reps[i]
@@ -201,9 +237,9 @@ def main() -> None:
                     raise
                 if bs > 1:
                     bs = max(1, bs // 2)
-                    print(f"\n[embed][OOM] reducing batch size to {bs} and retrying…")
+                    print(f"\n[embed][OOM] reducing batch size to {bs} and retrying…", flush=True)
                 else:
-                    print("\n[embed][OOM] batch_size=1 still OOM on GPU; falling back to CPU for remaining sequences.")
+                    print("\n[embed][OOM] batch_size=1 still OOM on GPU; falling back to CPU for remaining sequences.", flush=True)
                     device = torch.device("cpu")
                     model.to(device)
                     use_fp16 = False
@@ -212,9 +248,9 @@ def main() -> None:
                     torch.cuda.empty_cache()
                     if bs > 1:
                         bs = max(1, bs // 2)
-                        print(f"\n[embed][OOM] reducing batch size to {bs} and retrying…")
+                        print(f"\n[embed][OOM] reducing batch size to {bs} and retrying…", flush=True)
                     else:
-                        print("\n[embed][OOM] unrecoverable at batch_size=1; aborting.")
+                        print("\n[embed][OOM] unrecoverable at batch_size=1; aborting.", flush=True)
                         if show_progress:
                             pbar.close()
                         raise

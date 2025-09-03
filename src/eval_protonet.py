@@ -13,6 +13,7 @@ import numpy as np
 import torch
 import yaml
 from sklearn.metrics import accuracy_score, f1_score
+from tqdm.auto import trange
 
 from .episodic_sampler import EpisodeSampler
 from .protonet import ProtoConfig, ProtoNet
@@ -30,10 +31,23 @@ def pick_device(cfg: dict) -> torch.device:
     return torch.device(d)
 
 
-def eval_for_K(model: ProtoNet, sampler: EpisodeSampler, M: int, K: int, Q: int, episodes: int) -> Dict[str, float]:
+def eval_for_K(
+    model: ProtoNet,
+    sampler: EpisodeSampler,
+    M: int,
+    K: int,
+    Q: int,
+    episodes: int,
+    show_progress: bool = True,
+) -> Dict[str, float]:
     ys, yh = [], []
     with torch.no_grad():
-        for _ in range(episodes):
+        for _ in trange(
+            episodes,
+            desc="[eval] episodes",
+            dynamic_ncols=True,
+            disable=not show_progress,
+        ):
             sx, sy, qx, qy = sampler.sample_episode(M, K, Q)
             pred = model.predict(sx, sy, qx)
             ys.extend(qy.cpu().numpy().tolist())
@@ -75,9 +89,10 @@ def main() -> None:
     n_eval = int(episodes_cfg.get("eval", max(100, int(episodes_cfg.get("val", 200)))))
 
     results: Dict[str, Dict[str, float]] = {}
+    show_progress = bool(cfg.get("progress", True))
     for K in cfg["episode"]["K_eval"]:
         print(f"[eval] M={M} K={K} Q={Q} episodes={n_eval}")
-        metrics = eval_for_K(model, test_sampler, M, int(K), Q, n_eval)
+        metrics = eval_for_K(model, test_sampler, M, int(K), Q, n_eval, show_progress=show_progress)
         results[f"K={K}"] = metrics
         print(f"[eval] {metrics}")
 

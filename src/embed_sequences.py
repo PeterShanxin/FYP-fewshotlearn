@@ -263,9 +263,32 @@ def main() -> None:
 
     out_path = Path(paths["embeddings"]) 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(out_path, **out)
-    dim = next(iter(out.values())).shape[0] if out else 0
-    print(f"[embed] wrote {len(out)} embeddings (dim={dim}) → {out_path}")
+
+    # Derive contiguous array paths from the configured NPZ path
+    base_str = str(out_path)
+    if base_str.endswith(".npz"):
+        base_str = base_str[:-4]
+    X_path = Path(base_str + ".X.npy")
+    keys_path = Path(base_str + ".keys.npy")
+
+    # Write contiguous array + keys (fast mmap loading)
+    if out:
+        # Deterministic key order (sorted) for reproducibility
+        keys_list = sorted(out.keys())
+        X = np.stack([out[k] for k in keys_list]).astype("float32", copy=False)
+        np.save(X_path, X)
+        np.save(keys_path, np.array(keys_list, dtype="U"))
+        print(
+            f"[embed] wrote contiguous embeddings: N={len(keys_list)} dim={X.shape[1]} → {X_path}, {keys_path}"
+        )
+    else:
+        print("[embed] WARNING: no embeddings to write (empty output)")
+
+    # Optionally write legacy NPZ for portability (uncompressed for faster load)
+    if bool(cfg.get("write_legacy_npz", False)):
+        np.savez(out_path, **out)
+        dim = next(iter(out.values())).shape[0] if out else 0
+        print(f"[embed] wrote legacy NPZ with {len(out)} arrays (dim={dim}) → {out_path}")
 
 
 if __name__ == "__main__":

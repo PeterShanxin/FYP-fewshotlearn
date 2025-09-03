@@ -33,7 +33,10 @@ Writes JSONL files under `data/splits/` – one EC class per line.
 ```bash
 python -m src.embed_sequences -c config.yaml
 ```
-Creates `data/emb/embeddings.npz` mapping accession → float32 vector.
+Creates fast‑loading contiguous files: 
+- `data/emb/embeddings.X.npy` (shape `[N, D]`, float32) and 
+- `data/emb/embeddings.keys.npy` (accessions, same order),
+which load via memory‑mapping for near‑instant startup. Optionally, set `write_legacy_npz: true` in the config to also write a legacy `embeddings.npz`.
 
 ### 4) Train ProtoNet episodically
 ```bash
@@ -87,6 +90,7 @@ Paths (relative):
 - Key changes vs. default:
   - ESM model: `esm2_t33_650M_UR50D` (larger, better quality)
   - Embedding: `batch_size_embed=512`, `fp16: true`, `max_seq_len: 1022`, `dynamic_batch: true`
+  - Embeddings are stored as contiguous `X.npy` + `keys.npy` for fast memory‑mapped loading (legacy `npz` optional).
   - Episodes: `train=10000`, `val=2000`, `eval=5000` for tighter confidence intervals
   - Device: `auto` (uses CUDA when available)
   - Training knobs: `eval_every=1000`, `episodes_per_val_check=200` (control validation cadence and variance)

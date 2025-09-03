@@ -15,7 +15,7 @@ from contextlib import contextmanager
 import numpy as np
 import torch
 import yaml
-from tqdm import trange
+from tqdm.auto import tqdm, trange
 
 from .episodic_sampler import EpisodeSampler
 from .protonet import ProtoConfig, ProtoNet
@@ -50,13 +50,27 @@ def evaluating(model: ProtoNet):
             model.train()
 
 
-def episodic_accuracy(model: ProtoNet, val_sampler: EpisodeSampler, M: int, K: int, Q: int, episodes: int) -> float:
-    from tqdm import trange
+def episodic_accuracy(
+    model: ProtoNet,
+    val_sampler: EpisodeSampler,
+    M: int,
+    K: int,
+    Q: int,
+    episodes: int,
+    show_progress: bool = True,
+) -> float:
     correct = 0
     total = 0
     with torch.no_grad():
         with evaluating(model):
-            for _ in trange(episodes, desc="[val] episodes", leave=False, ncols=80):
+            for _ in trange(
+                episodes,
+                desc="[val] episodes",
+                leave=False,
+                dynamic_ncols=True,
+                disable=not show_progress,
+                position=1,
+            ):
                 sx, sy, qx, qy = val_sampler.sample_episode(M, K, Q)
                 pred = model.predict(sx, sy, qx)
                 correct += int((pred == qy).sum().item())
@@ -94,6 +108,9 @@ def main() -> None:
     n_train = int(cfg["episodes"]["train"])
     n_val_eval = max(1, int(cfg["episodes"]["val"]))
 
+    show_progress = bool(cfg.get("progress", True))
+    verbose = bool(cfg.get("verbose", show_progress))
+
     print("[train] config:")
     print(json.dumps({
         "device": str(device), "M": M, "K_train": K, "Q": Q, "episodes_train": n_train,
@@ -109,7 +126,10 @@ def main() -> None:
     eval_every = max(50, n_train // 10)
 
     model.train()
-    for ep in trange(n_train, desc="episodes", ncols=80):
+    pbar = tqdm(
+        range(n_train), desc="episodes", dynamic_ncols=True, leave=True, disable=not show_progress
+    )
+    for ep in pbar:
         sx, sy, qx, qy = train_sampler.sample_episode(M, K, Q)
         logits, loss = model(sx, sy, qx, qy)
         opt.zero_grad()
@@ -117,20 +137,32 @@ def main() -> None:
         opt.step()
 
         if (ep + 1) % eval_every == 0 or ep == n_train - 1:
-            acc = episodic_accuracy(model, val_sampler, M, K, Q, episodes=min(50, n_val_eval))
+            acc = episodic_accuracy(
+                model, val_sampler, M, K, Q, episodes=min(50, n_val_eval), show_progress=show_progress
+            )
             history["val_acc"].append(acc)
             history["checkpoints_after_episode"].append(ep + 1)
-            print(f"\n[train] episode {ep+1}: val_acc={acc:.4f}")
+            if show_progress:
+                pbar.set_postfix({"val_acc": f"{acc:.4f}", "best": f"{max(best_acc, 0):.4f}"}, refresh=True)
+            elif verbose:
+                print(f"[train] episode {ep+1}: val_acc={acc:.4f}")
             if acc > best_acc:
                 best_acc = acc
                 best_state = {"model": model.state_dict()}
                 checks_without_improve = 0
-                print(f"[train] best_val_acc improved to {best_acc:.4f} | checkpoint will be saved")
+                if show_progress:
+                    pbar.set_postfix({"val_acc": f"{acc:.4f}", "best": f"{best_acc:.4f}", "note": "new best"}, refresh=True)
+                elif verbose:
+                    print(f"[train] best_val_acc improved to {best_acc:.4f} | checkpoint will be saved")
             else:
                 checks_without_improve += 1
             if checks_without_improve >= patience_checks:
-                print("[train] Early stopping triggered.")
+                if verbose:
+                    print("[train] Early stopping triggered.")
                 break
+
+    if show_progress:
+        pbar.close()
 
     # Save best checkpoint
     out_dir = Path(paths["outputs"]) / "checkpoints"

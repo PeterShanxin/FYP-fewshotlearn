@@ -1,0 +1,45 @@
+# Smoke-test configuration: tiny, fast, CPU-friendly
+
+embedding:
+  model: esm2_t12_35M_UR50D
+
+# Force CPU for widest compatibility in CI/smoke
+device: cpu
+
+# Keep episodes extremely small for speed
+episode:
+  M: 1              # ways (1-way episodes keep test minimal)
+  K_train: 1        # 1-shot training
+  K_eval: [1]       # evaluate only 1-shot
+  Q: 1              # 1 query per class
+
+episodes:
+  train: 5          # a handful of train episodes
+  val: 2            # tiny validation
+
+# Embedding runtime knobs
+batch_size_embed: 1
+max_seq_len: 80     # truncate to speed up ESM
+progress: false
+verbose: true
+dynamic_batch: false
+
+# ProtoNet head kept small
+projection_dim: 64
+temperature: 10.0
+
+# With replacement sampling allows tiny per-class counts
+min_sequences_per_class_for_train: 2
+random_seed: 123
+
+# Limit the size of splits for smoke (applied in prepare_split)
+limit_classes: 5           # keep only top-N EC classes by count
+limit_per_class: 3         # and at most this many accessions per class
+
+# Use the main fetched dataset; keep smoke outputs separate
+paths:
+  data_root: data/uniprot_ec
+  joined_tsv: data/uniprot_ec/swissprot_ec_joined.tsv
+  embeddings: data/emb/embeddings_smoke.npz
+  splits_dir: data/splits_smoke
+  outputs: results/smoke

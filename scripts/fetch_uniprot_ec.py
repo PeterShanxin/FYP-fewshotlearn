@@ -6,6 +6,7 @@ import urllib.parse
 import urllib.request
 import urllib.error
 import argparse
+import sys
 
 from tqdm import tqdm
 
@@ -20,6 +21,14 @@ parser.add_argument("--progress", dest="show_progress", action="store_true",
                     default=True, help="Show progress bar")
 parser.add_argument("--no-progress", dest="show_progress", action="store_false",
                     help="Disable progress bar")
+parser.add_argument("--data-root", dest="data_root", default="data/uniprot_ec",
+                    help="Output directory for downloaded and joined files")
+parser.add_argument("--query", dest="query", default='reviewed:true AND (ec:*)',
+                    help="UniProt query string (default: reviewed:true AND (ec:*) )")
+parser.add_argument("--force-download", dest="force_download", action="store_true", default=False,
+                    help="Force re-download even if files exist")
+parser.add_argument("--no-join", dest="skip_join", action="store_true", default=False,
+                    help="Skip TSV/FASTA parsing and join (only snapshot)")
 args = parser.parse_args()
 
 VERBOSE = args.verbose
@@ -34,7 +43,7 @@ def log(msg: str):
             print(msg)
 
 # Paths
-DATA_ROOT = Path('data/uniprot_ec')
+DATA_ROOT = Path(args.data_root)
 TMP_DIR = DATA_ROOT / '_tmp'  # retained for compatibility, though unused
 SNAPSHOT_META = DATA_ROOT / 'snapshot_meta.txt'
 TSV_FILE = DATA_ROOT / 'swissprot_ec.tsv'
@@ -49,7 +58,7 @@ TMP_DIR.mkdir(parents=True, exist_ok=True)
 # Original broad query. Some users have reported sporadic HTTP 400 responses from
 # UniProt's stream endpoint if certain characters are not encoded the way the
 # service expects (notably '*') or if there is transient routing / WAF filtering.
-QUERY = 'reviewed:true AND (ec:*)'
+QUERY = args.query
 # NOTE: UniProt uses 'taxon_id' for taxonomy information (formerly 'taxonomy_id').
 # Field reference: https://www.uniprot.org/help/return_fields (for latest names).
 FIELDS = 'accession,ec,protein_name,organism_id,organism_name,length'  # 'taxon_id' renamed to 'organism_id' in UniProt API
@@ -83,6 +92,13 @@ def _download(url: str, out_path: Path, label: str):
     # SyntaxError due to use-before-declaration).
     global TSV_URL, FASTA_URL, QUERY
     last_err = None
+    # If file already exists and force_download is False, reuse it
+    if out_path.exists() and out_path.stat().st_size > 0 and not args.force_download:
+        data = out_path.read_bytes()
+        sha = hashlib.sha256(data).hexdigest()
+        log(f"[cache] Using existing {label}: {out_path} ({len(data):,} bytes)")
+        return 'cached', sha
+
     for attempt in range(1, 4):
         try:
             req = urllib.request.Request(url, headers={
@@ -133,17 +149,7 @@ TSV_REL, TSV_SHA = _download(TSV_URL, TSV_FILE, 'TSV')
 log(f"[fetch] Downloading FASTA -> {FASTA_FILE}")
 FASTA_REL, FASTA_SHA = _download(FASTA_URL, FASTA_FILE, 'FASTA')
 
-# Progress bar for join steps
-steps = [
-    "Parse FASTA headers",
-    "Read TSV",
-    "Join TSV+FASTA",
-    "Write long format",
-    "Write snapshot meta"
-]
-pbar = tqdm(total=len(steps), desc="[dataFetch]", ncols=80, disable=not SHOW_PROGRESS)
-
-# Snapshot log
+# Snapshot block: write to file and print once BEFORE progress bar to avoid interleaving
 snapshot_lines = [
     "=== UniProt Enzyme Snapshot ===",
     datetime.now(timezone.utc).strftime("%a %b %d %H:%M:%S UTC %Y"),
@@ -155,13 +161,42 @@ snapshot_lines = [
     f"SHA256(TSV):   {TSV_SHA}  {TSV_FILE.name}",
     f"SHA256(FASTA): {FASTA_SHA}  {FASTA_FILE.name}",
 ]
-for line in snapshot_lines:
-    log(line)
 SNAPSHOT_META.write_text("\n".join(snapshot_lines) + "\n", encoding='utf-8')
+
+if VERBOSE:
+    # Print the snapshot once, cleanly, before showing any progress bars
+    print("\n".join(snapshot_lines))
+    print()  # extra newline for readability
+
+if args.skip_join:
+    log('[done]')
+    log(f'[ok] Snapshot written to {SNAPSHOT_META}')
+    log('[ok] Skipped join (--no-join)')
+    sys.exit(0)
+
+# Progress bar for join steps (print only the bar; keep other messages in the postfix)
+steps = [
+    "Parse FASTA headers",
+    "Read TSV",
+    "Join TSV+FASTA",
+    "Write long format",
+    "Write snapshot meta"
+]
+pbar = tqdm(
+    total=len(steps),
+    desc="[dataFetch]",
+    disable=not SHOW_PROGRESS,
+    dynamic_ncols=True,
+    leave=False,
+    bar_format="{desc} {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
+)
 
 
 # Parse FASTA
-log("[join] Parsing FASTA headers…")
+if SHOW_PROGRESS:
+    pbar.set_postfix_str("Parsing FASTA headers…")
+else:
+    log("[join] Parsing FASTA headers…")
 acc2seq = {}
 acc = None
 seq_lines = []
@@ -178,6 +213,8 @@ for line in FASTA_FILE.read_text().splitlines():
 if acc and seq_lines:
     acc2seq[acc] = ''.join(seq_lines)
 pbar.update(1)
+if SHOW_PROGRESS:
+    pbar.set_postfix_str("")
 
 
 # Read TSV
@@ -186,10 +223,13 @@ with TSV_FILE.open(newline='') as f:
     reader = csv.DictReader(f, delimiter='\t')
     rows.extend(reader)
 pbar.update(1)
+if SHOW_PROGRESS:
+    pbar.set_postfix_str("Joining TSV+FASTA…")
 
 
 # Join TSV + FASTA
-log(f"[join] Joining TSV+FASTA by accession -> {JOINED_TSV}")
+if not SHOW_PROGRESS:
+    log(f"[join] Joining TSV+FASTA by accession -> {JOINED_TSV}")
 joined_header = ['accession','ec','protein_name','taxon_id','organism_name','length','sequence']  # keep legacy column name 'taxon_id' for downstream compatibility
 with JOINED_TSV.open('w', newline='') as f:
     w = csv.writer(f, delimiter='\t')
@@ -231,6 +271,8 @@ pbar.update(1)
 
 pbar.update(1)
 pbar.close()
+
+# Final, compact messages after the bar is gone
 log('[done]')
 log(f'[ok] Snapshot written to {SNAPSHOT_META}')
 log(f'[ok] Joined table -> {JOINED_TSV}')

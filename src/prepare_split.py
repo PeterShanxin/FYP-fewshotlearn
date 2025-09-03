@@ -28,6 +28,8 @@ class Config:
     splits_dir: Path
     min_per_class: int
     seed: int
+    limit_classes: int | None = None
+    limit_per_class: int | None = None
 
 
 def load_config(path: str) -> Config:
@@ -39,6 +41,8 @@ def load_config(path: str) -> Config:
         splits_dir=Path(paths["splits_dir"]),
         min_per_class=int(cfg["min_sequences_per_class_for_train"]),
         seed=int(cfg.get("random_seed", 42)),
+        limit_classes=(int(cfg.get("limit_classes")) if cfg.get("limit_classes") is not None else None),
+        limit_per_class=(int(cfg.get("limit_per_class")) if cfg.get("limit_per_class") is not None else None),
     )
 
 
@@ -71,12 +75,33 @@ def split_classes(classes: List[str], seed: int) -> Tuple[List[str], List[str], 
     classes = classes[:]
     rnd.shuffle(classes)
     n = len(classes)
-    n_train = int(0.8 * n)
-    n_val = max(1, int(0.1 * n))
-    n_test = n - n_train - n_val
+    if n <= 1:
+        # all to train to keep pipeline running; val/test empty
+        return classes, [], []
+    if n == 2:
+        # ensure we have at least train and val for early stopping logic
+        return classes[:1], classes[1:], []
+
+    # For n >= 3, aim for ~80/10/10 but guarantee at least 1 in each split
+    n_train = max(1, int(round(0.8 * n)))
+    n_val = max(1, int(round(0.1 * n)))
+    n_test = max(1, n - n_train - n_val)
+
+    # If we over-allocated due to rounding, trim train first, then val/test
+    while n_train + n_val + n_test > n and n_train > 1:
+        n_train -= 1
+    while n_train + n_val + n_test > n and n_val > 1:
+        n_val -= 1
+    while n_train + n_val + n_test > n and n_test > 1:
+        n_test -= 1
+
+    # Final safeguard
+    if n_train + n_val + n_test > n:
+        n_train = max(1, n - n_val - n_test)
+
     train = classes[:n_train]
     val = classes[n_train : n_train + n_val]
-    test = classes[n_train + n_val :]
+    test = classes[n_train + n_val : n_train + n_val + n_test]
     return train, val, test
 
 
@@ -101,6 +126,8 @@ def main() -> None:
                 splits_dir=str(cfg.splits_dir),
                 min_per_class=cfg.min_per_class,
                 seed=cfg.seed,
+                limit_classes=cfg.limit_classes,
+                limit_per_class=cfg.limit_per_class,
             ),
             indent=2,
         )
@@ -113,6 +140,26 @@ def main() -> None:
 
     df = pd.read_csv(cfg.joined_tsv, sep="\t")
     df = filter_single_ec(df)
+
+    # Optional downsampling for smoke tests: keep only top-N classes and at most
+    # K sequences per class. This reduces embedding/training time drastically
+    # while still exercising the full pipeline.
+    if cfg.limit_classes is not None or cfg.limit_per_class is not None:
+        # Count sequences per EC and sort by count desc for determinism
+        counts = (
+            df.groupby("ec")["accession"].count().sort_values(ascending=False)
+        )
+        if cfg.limit_classes is not None:
+            keep_classes = set(counts.head(max(1, int(cfg.limit_classes))).index.tolist())
+            df = df[df["ec"].isin(keep_classes)]
+        # Within each class, sample up to limit_per_class sequences (stable if not sampling)
+        if cfg.limit_per_class is not None:
+            def _take_n(g: pd.DataFrame) -> pd.DataFrame:
+                n = int(cfg.limit_per_class or 0)
+                if len(g) <= n:
+                    return g
+                return g.sample(n=n, random_state=cfg.seed)
+            df = df.groupby("ec", group_keys=False).apply(_take_n)
 
     by_ec = group_by_ec(df)
     base_classes = [ec for ec, accs in by_ec.items() if len(accs) >= cfg.min_per_class]

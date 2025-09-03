@@ -61,7 +61,7 @@ def main() -> None:
     ckpt_path = Path(paths["outputs"]) / "checkpoints" / "protonet.pt"
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}. Train first.")
-    state = torch.load(ckpt_path, map_location=device)
+    state = torch.load(ckpt_path, map_location=device, weights_only=True)
     model.load_state_dict(state["model"])  # type: ignore[index]
     model.eval()
 

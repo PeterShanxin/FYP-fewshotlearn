@@ -163,7 +163,9 @@ def main() -> None:
         _, _, tokens = batch_converter(data)
         tokens = tokens.to(device)
         autocast_ctx = (
-            torch.cuda.amp.autocast(dtype=torch.float16) if (use_fp16 and device.type == "cuda") else torch.cuda.amp.autocast(enabled=False)
+            torch.amp.autocast("cuda", dtype=torch.float16)
+            if use_fp16 and device.type == "cuda"
+            else torch.amp.autocast("cuda", enabled=False)
         )
         with autocast_ctx:
             reps = model(tokens, repr_layers=[model.num_layers], return_contacts=False)["representations"][model.num_layers]

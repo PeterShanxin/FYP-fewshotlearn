@@ -198,9 +198,9 @@ def main() -> None:
         else:
             tokens = tokens.to(device)
         autocast_ctx = (
-            torch.amp.autocast("cuda", dtype=torch.float16)
+            torch.amp.autocast(device.type, dtype=torch.float16)
             if use_fp16 and device.type == "cuda"
-            else torch.amp.autocast("cuda", enabled=False)
+            else torch.amp.autocast(device.type, enabled=False)
         )
         # Determine num_layers for both bare model and DataParallel wrapper
         num_layers = getattr(getattr(model, 'module', model), 'num_layers')

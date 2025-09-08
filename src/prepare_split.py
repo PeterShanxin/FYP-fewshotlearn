@@ -71,17 +71,11 @@ def filter_or_expand_ec(df: pd.DataFrame, allow_multi_ec: bool) -> pd.DataFrame:
     if not allow_multi_ec:
         mask_single = ~df["ec"].astype(str).str.contains(";")
         return df[mask_single]
-    # Expand to long format: one row per (accession, ec)
-    rows = []
-    for _, r in df.iterrows():
-        ecs = [e.strip() for e in str(r["ec"]).split(";") if e.strip()]
-        for ec in ecs:
-            rr = r.copy()
-            rr["ec"] = ec
-            rows.append(rr)
-    if not rows:
-        return df.iloc[0:0]
-    return pd.DataFrame(rows)[df.columns]
+    cols = df.columns
+    df = df.assign(ec=df["ec"].str.split(";")).explode("ec")
+    df["ec"] = df["ec"].str.strip()
+    df = df[df["ec"] != ""]
+    return df[cols]
 
 
 def group_by_ec(df: pd.DataFrame) -> Dict[str, List[str]]:

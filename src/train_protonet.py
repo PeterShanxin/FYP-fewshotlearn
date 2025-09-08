@@ -84,6 +84,59 @@ def episodic_accuracy(
     return correct / max(total, 1)
 
 
+def _apply_hierarchy_loss(
+    model: ProtoNet,
+    s: torch.Tensor,
+    q: torch.Tensor,
+    sy: torch.Tensor,
+    qy: torch.Tensor,
+    classes: list,
+    cfg: dict,
+    multi_label: bool,
+) -> torch.Tensor:
+    """Optional hierarchical supervision over EC levels."""
+    hier_levels = int(cfg.get("hierarchy_levels", 0))
+    hier_w = float(cfg.get("hierarchy_weight", 0.0))
+    if hier_levels <= 0 or hier_w <= 0.0:
+        return s.new_tensor(0.0)
+
+    device = s.device
+    use_lvls = [lvl for lvl in range(1, min(hier_levels, 3) + 1)]
+    per_w = hier_w / max(len(use_lvls), 1)
+    extra = s.new_tensor(0.0)
+
+    for lvl in use_lvls:
+        parts = [ec.split('.') for ec in classes]
+        coarse = ['.'.join(p[:lvl]) for p in parts]
+        uniq = {t: i for i, t in enumerate(sorted(set(coarse)))}
+        if len(uniq) < 2:
+            continue
+
+        y_coarse = torch.tensor(
+            [uniq[coarse[int(y.item())]] for y in sy],
+            dtype=torch.long,
+            device=device,
+        )
+        P_c = model.prototypes(s, y_coarse)
+        logits_c = (q @ P_c.T) / model.temp
+
+        if multi_label and qy.dim() == 2:
+            q_c = torch.zeros((qy.shape[0], len(uniq)), dtype=torch.float32, device=device)
+            for j, t in enumerate(coarse):
+                gid = uniq[t]
+                q_c[:, gid] = torch.maximum(q_c[:, gid], qy[:, j])
+            extra = extra + per_w * torch.nn.functional.binary_cross_entropy_with_logits(logits_c, q_c)
+        else:
+            yq_c = torch.tensor(
+                [uniq[coarse[int(y.item())]] for y in qy],
+                dtype=torch.long,
+                device=device,
+            )
+            extra = extra + per_w * torch.nn.functional.cross_entropy(logits_c, yq_c)
+
+    return extra
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("-c", "--config", default="config.yaml")
@@ -177,63 +230,18 @@ def main() -> None:
         if use_amp:
             with torch.cuda.amp.autocast(dtype=torch.float16):
                 logits, loss = model(sx, sy, qx, qy)
-                # Optional hierarchical supervision over EC levels
-                hier_levels = int(cfg.get("hierarchy_levels", 0))
-                hier_w = float(cfg.get("hierarchy_weight", 0.0))
-                if hier_levels > 0 and hier_w > 0.0:
-                    s = model.embed(sx)
-                    q = model.embed(qx)
-                    use_lvls = [lvl for lvl in range(1, min(hier_levels, 3) + 1)]
-                    per_w = hier_w / max(len(use_lvls), 1)
-                    for lvl in use_lvls:
-                        parts = [ec.split('.') for ec in classes]
-                        coarse = ['.'.join(p[:lvl]) for p in parts]
-                        uniq = {t: i for i, t in enumerate(sorted(set(coarse)))}
-                        if len(uniq) < 2:
-                            continue
-                        y_coarse = torch.tensor([uniq[coarse[int(y.item())]] for y in sy], dtype=torch.long, device=device)
-                        P_c = model.prototypes(s, y_coarse)
-                        logits_c = (q @ P_c.T) / model.temp
-                        if multi_label and qy.dim() == 2:
-                            q_c = torch.zeros((qy.shape[0], len(uniq)), dtype=torch.float32, device=device)
-                            for j, t in enumerate(coarse):
-                                gid = uniq[t]
-                                q_c[:, gid] = torch.maximum(q_c[:, gid], qy[:, j])
-                            loss = loss + per_w * torch.nn.functional.binary_cross_entropy_with_logits(logits_c, q_c)
-                        else:
-                            yq_c = torch.tensor([uniq[coarse[int(y.item())]] for y in qy], dtype=torch.long, device=device)
-                            loss = loss + per_w * torch.nn.functional.cross_entropy(logits_c, yq_c)
+                s = model.embed(sx)
+                q = model.embed(qx)
+                loss = loss + _apply_hierarchy_loss(model, s, q, sy, qy, classes, cfg, multi_label)
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
         else:
             logits, loss = model(sx, sy, qx, qy)
-            hier_levels = int(cfg.get("hierarchy_levels", 0))
-            hier_w = float(cfg.get("hierarchy_weight", 0.0))
-            if hier_levels > 0 and hier_w > 0.0:
-                s = model.embed(sx)
-                q = model.embed(qx)
-                use_lvls = [lvl for lvl in range(1, min(hier_levels, 3) + 1)]
-                per_w = hier_w / max(len(use_lvls), 1)
-                for lvl in use_lvls:
-                    parts = [ec.split('.') for ec in classes]
-                    coarse = ['.'.join(p[:lvl]) for p in parts]
-                    uniq = {t: i for i, t in enumerate(sorted(set(coarse)))}
-                    if len(uniq) < 2:
-                        continue
-                    y_coarse = torch.tensor([uniq[coarse[int(y.item())]] for y in sy], dtype=torch.long, device=device)
-                    P_c = model.prototypes(s, y_coarse)
-                    logits_c = (q @ P_c.T) / model.temp
-                    if multi_label and qy.dim() == 2:
-                        q_c = torch.zeros((qy.shape[0], len(uniq)), dtype=torch.float32, device=device)
-                        for j, t in enumerate(coarse):
-                            gid = uniq[t]
-                            q_c[:, gid] = torch.maximum(q_c[:, gid], qy[:, j])
-                        loss = loss + per_w * torch.nn.functional.binary_cross_entropy_with_logits(logits_c, q_c)
-                    else:
-                        yq_c = torch.tensor([uniq[coarse[int(y.item())]] for y in qy], dtype=torch.long, device=device)
-                        loss = loss + per_w * torch.nn.functional.cross_entropy(logits_c, yq_c)
+            s = model.embed(sx)
+            q = model.embed(qx)
+            loss = loss + _apply_hierarchy_loss(model, s, q, sy, qy, classes, cfg, multi_label)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()

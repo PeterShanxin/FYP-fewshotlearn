@@ -4,7 +4,7 @@
 Enhancements:
 - Build clusters as connected components of the ≥T% identity graph to ensure
   no cross-fold identity leakage at the threshold (when tools available).
-- Optional fast path using MMseqs2 pairwise search with coverage filter; fallback
+- Fast path uses MMseqs2 pairwise search with coverage filter; fallback
   to a Python O(N^2) approximate identity for small smoke tests.
 - Persist artifacts per threshold under results/split-XX/ (clusters, folds, config) and
   split JSONLs under results/split-XX/fold-YY/{train,val,test}.jsonl.
@@ -80,34 +80,7 @@ def mmseqs_pairwise_edges(fasta: Path, workdir: Path, min_id: float, min_cov: fl
     return sorted(edges)
 
 
-def cluster_with_cdhit(fasta: Path, workdir: Path, min_id: float) -> Dict[str, str]:
-    workdir.mkdir(parents=True, exist_ok=True)
-    outroot = workdir / "cdhit"
-    threads = str(max(1, (os.cpu_count() or 1)))
-    log_path = workdir / "logs" / "cdhit.log"
-    run_quiet([
-        "cd-hit", "-i", str(fasta), "-o", str(outroot), "-c", str(min_id), "-n", "2",
-        "-T", threads, "-M", "0",
-    ], cwd=None, log_file=log_path)
-    clstr = Path(str(outroot) + ".clstr")
-    mapping: Dict[str, str] = {}
-    rep = None
-    with open(clstr, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            if line.startswith(">Cluster"):
-                rep = None
-                continue
-            right = line.split(">", 1)[1]
-            acc = right.split("...", 1)[0]
-            if line.endswith("*"):
-                rep = acc
-                mapping.setdefault(rep, rep)
-            if rep is not None:
-                mapping[acc] = rep
-    return mapping
+# CD-HIT support removed for simplicity; MMseqs2 or Python fallback only.
 
 def python_pairwise_edges(pairs: List[Tuple[str, str]], min_ratio: float) -> List[Tuple[str, str]]:
     """Very slow O(N^2) approximate edge builder using difflib ratio.

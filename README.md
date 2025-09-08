@@ -35,7 +35,7 @@ python -m src.prepare_split -c config.yaml
 Writes JSONL files under `data/splits/` – one EC class per line. Multi‑EC rows are expanded by default so each accession appears under all of its ECs.
 
 ### 2.5) Cluster sequences for identity‑aware episodes
-Create an accession→cluster map using MMseqs2 (preferred) or CD‑HIT, with a Python fallback for small tests.
+Create an accession→cluster map using MMseqs2 (preferred). If MMseqs2 is not available on PATH, the script falls back to a slow Python implementation for small tests.
 ```bash
 python scripts/cluster_sequences.py -c config.yaml
 ```
@@ -186,22 +186,21 @@ Your mileage varies with data volume and CPU/GPU.
 ---
 
 ## Core Features
-- Identity‑aware episodes: enabled by default with `identity_disjoint: true`. Generate the clustering map via `scripts/cluster_sequences.py` using MMseqs2/CD‑HIT when available (Python fallback for small tests). Defaults: `cluster_identity: 0.5`, `cluster_coverage: 0.5`.
+- Identity‑aware episodes: enabled by default with `identity_disjoint: true`. Generate the clustering map via `scripts/cluster_sequences.py` using MMseqs2 when available (Python fallback for small tests). Defaults: `cluster_identity: 0.5`, `cluster_coverage: 0.5`.
 - Multi‑EC support: enabled via `allow_multi_ec: true` (split expansion) and `multi_label: true` (BCE over episode classes). Episodic accuracy counts a prediction as correct if top‑1 is among true labels.
 - EC hierarchy: enabled via `hierarchy_levels` (1–3) and `hierarchy_weight` to add auxiliary losses at coarser EC levels using prototype grouping per episode.
 
-### HPC Modules (MMseqs2/CD-HIT)
-On module-managed clusters, load clustering tools before running the pipeline:
+### HPC Modules (MMseqs2)
+On module-managed clusters, load MMseqs2 before running the pipeline:
 ```bash
-module load CD-HIT
 module load MMseqs2
 ```
-The pipeline prefers MMseqs2, then CD-HIT; if neither is available on PATH, it falls back to a slow Python implementation for small tests.
+If MMseqs2 is not available on PATH, the scripts fall back to a slow Python implementation suitable only for small smoke tests.
 
 You can also declare modules in your config to have `run_all.sh` load them automatically:
 ```yaml
 # config.yaml
-modules: [MMseqs2, CD-HIT]
+modules: [MMseqs2]
 ```
 This is optional; if the `module` command is unavailable, the script continues without loading.
 
@@ -234,7 +233,7 @@ Goal: enforce that no test sequence shares more than X% identity with any traini
   - Cross-threshold summary: `results/summary_by_id_threshold.json`
 
 Notes:
-- Splits are made by clusters, not individual sequences. Entire clusters go to the test fold, guaranteeing the specified identity ceiling between train and test (when MMseqs2/CD-HIT is available).
+- Splits are made by clusters, not individual sequences. Entire clusters go to the test fold, guaranteeing the specified identity ceiling between train and test (when MMseqs2 is available).
 - Episodic sampling also enforces within-episode identity disjointness when `identity_disjoint: true` (uses the same cluster map).
 
 ### Metrics (Eval)

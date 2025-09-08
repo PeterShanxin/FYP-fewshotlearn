@@ -62,7 +62,7 @@ PY
 
 echo "[run_all] Using config: ${CFG} (force-embed=${FORCE_EMBED})"
 
-# Optionally load HPC modules declared in config (modules: [MMseqs2, CD-HIT])
+# Optionally load HPC modules declared in config (modules: [MMseqs2])
 init_module() {
   # Detect and initialize Environment Modules/Lmod if available
   if type module >/dev/null 2>&1; then

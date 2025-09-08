@@ -14,10 +14,9 @@ embedding:
 device: auto
 
 # Optional: load HPC environment modules before running
-# Adjust names/versions to your cluster (e.g., MMseqs2/14, cd-hit/4.8.1)
+# Adjust names/versions to your cluster (e.g., MMseqs2/14)
 modules:
   - MMseqs2
-  - CD-HIT
 
 # Episode settings (few-shot task shape)
 episode:

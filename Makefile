@@ -23,7 +23,7 @@ CFG ?= config.yaml
 	@echo "  install     - pip install minimal dependencies"
 	@echo "  fetch       - download Swiss-Prot (reviewed+EC), snapshot, join TSV+FASTA"
 	@echo "  split       - build EC class splits (multi-EC expanded)"
-	@echo "  cluster     - cluster sequences for identity-aware sampling (MMseqs2/CD-HIT/Python)"
+	@echo "  cluster     - cluster sequences for identity-aware sampling (MMseqs2 or Python fallback)"
 	@echo "  embed       - compute ESM2 mean-pooled embeddings (writes contiguous X.npy + keys.npy)"
 	@echo "  train       - episodic training of ProtoNet with early stopping"
 	@echo "  eval        - episodic meta-test evaluation (accuracy & macro-F1)"

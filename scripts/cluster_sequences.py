@@ -2,8 +2,8 @@
 """Cluster sequences at a fixed identity threshold (default: 50%).
 
 Pipeline step to generate an accession->cluster_id TSV for identity-aware
-episode sampling. Prefers MMseqs2, then CD-HIT; falls back to a slow
-approximate Python clustering if neither binary is available.
+episode sampling. Uses MMseqs2 when available; falls back to a slow
+approximate Python clustering if MMseqs2 is not available.
 
 Outputs to paths.clusters_tsv from the config.
 """
@@ -108,40 +108,7 @@ def cluster_with_mmseqs(fasta: Path, workdir: Path, min_id: float, min_cov: floa
     return mapping
 
 
-def cluster_with_cdhit(fasta: Path, workdir: Path, min_id: float) -> Dict[str, str]:
-    workdir.mkdir(parents=True, exist_ok=True)
-    outroot = workdir / "cdhit"
-    threads = str(max(1, (os.cpu_count() or 1)))
-    # For 50% identity CD-HIT requires word size -n 2
-    run_quiet([
-        "cd-hit", "-i", str(fasta), "-o", str(outroot), "-c", str(min_id), "-n", "2",
-        "-T", threads, "-M", "0",
-    ], log_file=workdir / "logs" / "cdhit.log")
-    clstr = Path(str(outroot) + ".clstr")
-    mapping: Dict[str, str] = {}
-    rep = None
-    if not clstr.exists():
-        return mapping
-    with open(clstr, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            if line.startswith(">Cluster"):
-                rep = None
-                continue
-            # Example line: "0 123aa, >ACC123... *" or "0 98aa, >ACC456... at 98%"
-            try:
-                right = line.split(">", 1)[1]
-                acc = right.split("...", 1)[0]
-            except Exception:
-                continue
-            if line.endswith("*"):
-                rep = acc
-                mapping.setdefault(rep, rep)
-            if rep is not None:
-                mapping[acc] = rep
-    return mapping
+# CD-HIT support removed for simplicity; MMseqs2 or Python fallback only.
 
 
 def sim_ratio(a: str, b: str) -> float:
@@ -155,7 +122,7 @@ def cluster_greedy(pairs: List[Tuple[str, str]], min_ratio: float) -> Dict[str, 
     N = len(pairs)
     if N > 5000:
         print(f"[cluster][warn] {N} sequences; Python fallback clustering may be very slow."
-              " Install MMseqs2 or CD-HIT for speed.")
+              " Install MMseqs2 for speed.")
     mapping: Dict[str, str] = {}
     for i, (acc_i, seq_i) in enumerate(pairs):
         if acc_i in mapping:
@@ -207,11 +174,8 @@ def main() -> None:
     if shutil.which("mmseqs") is not None:
         print(f"[cluster] Using MMseqs2 at min_id={min_id}, min_cov={min_cov} (quiet; logs under {workdir/'logs'})")
         mapping = cluster_with_mmseqs(fasta, workdir, min_id=min_id, min_cov=min_cov)
-    elif shutil.which("cd-hit") is not None:
-        print(f"[cluster] Using CD-HIT at min_id={min_id} (quiet; logs under {workdir/'logs'})")
-        mapping = cluster_with_cdhit(fasta, workdir, min_id=min_id)
     else:
-        print("[cluster] MMseqs2/CD-HIT not found; falling back to slow Python clustering (approximate)")
+        print("[cluster] MMseqs2 not found; falling back to slow Python clustering (approximate)")
         mapping = cluster_greedy(pairs, min_ratio=min_id)
 
     if not mapping:

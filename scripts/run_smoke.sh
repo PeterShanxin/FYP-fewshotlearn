@@ -42,4 +42,4 @@ echo "[smoke] Using config: ${CFG}"
 # Delegate to the main pipeline with the smoke config.
 bash scripts/run_all.sh "${CFG}"
 
-echo "[smoke] Done. Artifacts in results/smoke and data/emb/embeddings_smoke.npz"
+echo "[smoke] Done. Artifacts in results/smoke and data/emb/embeddings_smoke.X.npy + embeddings_smoke.keys.npy"

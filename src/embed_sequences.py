@@ -1,9 +1,9 @@
-"""Compute mean-pooled ESM2-t12-35M embeddings for accessions referenced in splits.
+"""Compute mean-pooled ESM2 embeddings for accessions referenced in splits.
 
 - Reads sequences from the joined TSV (column: sequence)
 - Collects the union of accessions appearing in train/val/test splits
-- Uses esm2_t12_35M_UR50D; CPU-safe by default (batch size from config)
-- Saves a compressed .npz mapping accession -> float32 vector
+- Uses ESM2 (model from config); CPU or GPU
+- Writes contiguous arrays: `embeddings.X.npy` (float32, [N, D]) and `embeddings.keys.npy`
 """
 from __future__ import annotations
 
@@ -83,7 +83,7 @@ def main() -> None:
         "fp16": bool(use_fp16),
         "max_seq_len": max_seq_len,
         "joined_tsv": paths["joined_tsv"],
-        "out_npz": paths["embeddings"],
+        "embeddings_base": paths["embeddings"],
     }
     print(json.dumps(cfg_display, indent=2))
 
@@ -264,7 +264,7 @@ def main() -> None:
     out_path = Path(paths["embeddings"]) 
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Derive contiguous array paths from the configured NPZ path
+    # Derive contiguous array paths from the configured embeddings base (accepts legacy .npz suffix)
     base_str = str(out_path)
     if base_str.endswith(".npz"):
         base_str = base_str[:-4]
@@ -284,11 +284,7 @@ def main() -> None:
     else:
         print("[embed] WARNING: no embeddings to write (empty output)")
 
-    # Optionally write legacy NPZ for portability (uncompressed for faster load)
-    if bool(cfg.get("write_legacy_npz", False)):
-        np.savez(out_path, **out)
-        dim = next(iter(out.values())).shape[0] if out else 0
-        print(f"[embed] wrote legacy NPZ with {len(out)} arrays (dim={dim}) → {out_path}")
+    # Legacy NPZ output removed: embeddings are stored only as contiguous arrays.
 
 
 if __name__ == "__main__":

@@ -79,7 +79,7 @@ force_fetch: false
 paths:
   data_root: data/uniprot_ec
   joined_tsv: data/uniprot_ec/swissprot_ec_joined.tsv
-  embeddings: data/emb/embeddings.npz
+  embeddings: data/emb/embeddings
   splits_dir: data/splits
   outputs: results
   # Optional clustering map for identity-aware sampling: accession\tcluster_id

@@ -66,7 +66,7 @@ limit_per_class: 3         # and at most this many accessions per class
 paths:
   data_root: data/uniprot_ec
   joined_tsv: data/uniprot_ec/swissprot_ec_joined.tsv
-  embeddings: data/emb/embeddings_smoke.npz
+  embeddings: data/emb/embeddings_smoke
   splits_dir: data/splits_smoke
   outputs: results/smoke
   clusters_tsv: data/identity/clusters_smoke.tsv

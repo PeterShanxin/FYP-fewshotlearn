@@ -128,6 +128,9 @@ class EpisodeSampler:
     def sample_episode(self, M: int, K: int, Q: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, List[str]]:
         """Sample a single episode.
 
+        Each class must provide at least ``K + Q`` distinct examples. If a class
+        has fewer available, a ``RuntimeError`` is raised.
+
         Args:
             M: Number of classes.
             K: Number of support samples per class. Must be positive.
@@ -135,6 +138,7 @@ class EpisodeSampler:
 
         Raises:
             ValueError: If ``K`` or ``Q`` is not a positive integer.
+            RuntimeError: If any class has fewer than ``K + Q`` samples.
         """
         if K <= 0 or Q <= 0:
             raise ValueError("K and Q must be positive integers")
@@ -145,6 +149,11 @@ class EpisodeSampler:
             pool_idx = self.class2idx.get(ec, [])
             if len(pool_idx) == 0:
                 raise RuntimeError(f"No embeddings for class {ec}")
+            need = K + Q
+            if len(pool_idx) < need:
+                raise RuntimeError(
+                    f"Class {ec} has only {len(pool_idx)} samples, but requires at least {need} (K + Q)"
+                )
             # Helper to get accession for a row
             def idx2acc(i_row: int) -> str:
                 return str(self.keys[i_row])  # type: ignore[attr-defined]
@@ -177,11 +186,7 @@ class EpisodeSampler:
                     # fallback: sample from any cluster
                     q_idx = [self.rng.choice(pool_idx) for _ in range(Q)]
             else:
-                need = K + Q
-                if len(pool_idx) >= need:
-                    chosen = self.rng.sample(pool_idx, need)
-                else:
-                    chosen = [self.rng.choice(pool_idx) for _ in range(need)]
+                chosen = self.rng.sample(pool_idx, need)
                 s_idx = chosen[:K]
                 q_idx = chosen[K:]
             for i_row in s_idx:

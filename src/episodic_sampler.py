@@ -152,6 +152,7 @@ class EpisodeSampler:
 
         Raises:
             ValueError: If ``K`` or ``Q`` is not a positive integer.
+            RuntimeError: If a class has fewer than ``K + Q`` available samples.
         """
         if K <= 0 or Q <= 0:
             raise ValueError("K and Q must be positive integers")
@@ -163,6 +164,11 @@ class EpisodeSampler:
                 pool_idx = self.class2idx.get(ec, [])
                 if len(pool_idx) == 0:
                     raise RuntimeError(f"No embeddings for class {ec}")
+                need = K + Q
+                if len(pool_idx) < need:
+                    raise RuntimeError(
+                        f"Not enough embeddings for class {ec}: have {len(pool_idx)}, need {need}"
+                    )
                 # Helper to get accession for a row
                 def idx2acc(i_row: int) -> str:
                     return str(self.keys[i_row])  # type: ignore[attr-defined]
@@ -195,11 +201,7 @@ class EpisodeSampler:
                         # fallback: sample from any cluster
                         q_idx = [self.rng.choice(pool_idx) for _ in range(Q)]
                 else:
-                    need = K + Q
-                    if len(pool_idx) >= need:
-                        chosen = self.rng.sample(pool_idx, need)
-                    else:
-                        chosen = [self.rng.choice(pool_idx) for _ in range(need)]
+                    chosen = self.rng.sample(pool_idx, need)
                     s_idx = chosen[:K]
                     q_idx = chosen[K:]
                 for i_row in s_idx:
@@ -217,6 +219,11 @@ class EpisodeSampler:
                 pool = self.class2acc.get(ec, [])
                 if len(pool) == 0:
                     raise RuntimeError(f"No embeddings for class {ec}")
+                need = K + Q
+                if len(pool) < need:
+                    raise RuntimeError(
+                        f"Not enough embeddings for class {ec}: have {len(pool)}, need {need}"
+                    )
                 if self.acc2cluster and self.disjoint_support_query:
                     clusters: DefaultDict[str, List[str]] = defaultdict(list)
                     for a in pool:
@@ -242,11 +249,7 @@ class EpisodeSampler:
                     else:
                         q_acc = [self.rng.choice(pool) for _ in range(Q)]
                 else:
-                    need = K + Q
-                    if len(pool) >= need:
-                        chosen = self.rng.sample(pool, need)
-                    else:
-                        chosen = [self.rng.choice(pool) for _ in range(need)]
+                    chosen = self.rng.sample(pool, need)
                     s_acc = chosen[:K]
                     q_acc = chosen[K:]
                 for a in s_acc:

@@ -1,6 +1,11 @@
-# Few‑Shot Enzyme Classification (EC) with Prototypical Networks over ESM2‑t12‑35M
+# Few‑Shot Enzyme Classification (EC) with Identity Clustering, Multi‑EC, and Hierarchical Supervision
 
-Minimal, reproducible project for few‑shot EC classification using **metric‑based Prototypical Networks** trained on **ESM2‑t12‑35M (UR50D)** embeddings. Designed to run on a normal PC (CPU) or a single small GPU.
+Advanced, reproducible pipeline for few‑shot EC classification using **metric‑based Prototypical Networks** over **ESM2** embeddings. The pipeline now adopts three core capabilities by default:
+- Identity‑based clustering for disjoint support/query sampling and homology‑aware evaluation
+- Multi‑EC handling (multi‑label across episode classes)
+- EC hierarchy supervision (auxiliary losses at coarser EC levels)
+
+Runs on CPU or a single small GPU; embedding can leverage multi‑GPU when available.
 
 ---
 
@@ -18,16 +23,23 @@ pip install -r requirements.txt
 This pulls **reviewed** UniProtKB/Swiss‑Prot entries **with EC numbers**, saves TSV+FASTA, logs a snapshot (release date, URLs, SHA256), and produces a joined TSV.
 ```bash
 bash scripts/fetch_uniprot_ec.sh
-# or on Windows without WSL
-python scripts/fetch_uniprot_ec.py
+# or with the Python fetcher (supports --force-download)
+python scripts/fetch_uniprot_ec.py --force-download
 ```
 Outputs go to `data/uniprot_ec/`.
 
-### 2) Prepare cluster‑free class splits (meta‑train/val/test)
+### 2) Prepare EC class splits (multi‑EC expanded)
 ```bash
 python -m src.prepare_split -c config.yaml
 ```
-Writes JSONL files under `data/splits/` – one EC class per line.
+Writes JSONL files under `data/splits/` – one EC class per line. Multi‑EC rows are expanded by default so each accession appears under all of its ECs.
+
+### 2.5) Cluster sequences for identity‑aware episodes
+Create an accession→cluster map using MMseqs2 (preferred) or CD‑HIT, with a Python fallback for small tests.
+```bash
+python scripts/cluster_sequences.py -c config.yaml
+```
+Outputs `paths.clusters_tsv` (see `config.yaml`) and temporary files under `data/identity/_work/`.
 
 ### 3) Compute ESM2 embeddings (mean‑pooled per sequence)
 ```bash
@@ -38,17 +50,17 @@ Creates fast‑loading contiguous files:
 - `data/emb/embeddings.keys.npy` (accessions, same order),
 which load via memory‑mapping for near‑instant startup. Optionally, set `write_legacy_npz: true` in the config to also write a legacy `embeddings.npz`.
 
-### 4) Train ProtoNet episodically
+### 4) Train ProtoNet episodically (with hierarchy and multi‑EC)
 ```bash
 python -m src.train_protonet -c config.yaml
 ```
-Saves checkpoint at `results/checkpoints/protonet.pt` and training history at `results/history.json`.
+Saves checkpoint at `results/checkpoints/protonet.pt` and training history at `results/history.json`. Training uses multi‑label targets and hierarchical auxiliary losses by default (see config).
 
 ### 5) Evaluate episodically on meta‑test
 ```bash
 python -m src.eval_protonet -c config.yaml
 ```
-Writes `results/metrics.json` with accuracy and macro‑F1 for EC‑level labels treated as flat classes.
+Writes `results/metrics.json` keyed by K. In multi‑label mode: top‑1 hit accuracy (prediction counted correct if top‑1 is among true labels) plus micro/macro precision/recall/F1. In single‑label mode: accuracy and macro‑F1.
 
 ### One‑liners
 - Unix/macOS:
@@ -60,6 +72,25 @@ Writes `results/metrics.json` with accuracy and macro‑F1 for EC‑level labels
   scripts\run_all.bat
   ```
 
+## Common Workflows
+- Reuse embeddings, retrain only: clean results then train+eval.
+  - `bash scripts/clean_all.sh --yes --results`
+  - `make train eval CFG=config.yaml`  or  `bash scripts/run_all.sh config.yaml` (skips embed if present)
+- Re‑cluster then retrain: clean clusters and run cluster+train+eval.
+  - `bash scripts/clean_all.sh --yes --clusters`
+  - `make cluster train eval CFG=config.yaml`
+- Re‑embed then retrain: clean embeddings and run embed+train+eval.
+  - `bash scripts/clean_all.sh --yes --embeddings`
+  - `bash scripts/run_all.sh config.yaml`  (auto‑embeds, then trains+evals)
+- Force re‑embed even if files exist:
+  - `bash scripts/run_all.sh config.yaml --force-embed`
+- Identity CV benchmark (multi‑threshold): set `id_thresholds` in the config and run once.
+  - `bash scripts/run_all.sh config.yaml` (auto orchestrates prepare+benchmark)
+  - Or manual: `python scripts/prepare_identity_splits.py -c config.yaml` then `python scripts/run_identity_benchmark.py -c config.yaml`
+- Makefile shortcuts (Unix): targeted stages and full runs.
+  - `make all CFG=config.yaml` (fetch→split→cluster→embed→train→eval)
+  - `make split cluster train eval CFG=config.yaml`
+
 ---
 
 ## Defaults (tuned for low resource)
@@ -69,9 +100,12 @@ See `config.yaml` for all knobs. Key defaults:
 - `device`: auto (CUDA if available else CPU)
 - Episodes – `M=10`, `K_train=5`, `K_eval=[1,5]`, `Q=10`
 - Train/val episodes: `1000` / `200`
-- `batch_size_embed=4` (CPU‑safe)
+- `batch_size_embed=64` (raise on GPU; reduce on CPU)
 - ProtoNet: 256‑dim optional projection, cosine scores scaled by `temperature=10.0`
 - Split rule: classes with `< 40` sequences are sent to meta‑test pool
+- Multi‑EC: `allow_multi_ec=true` (expand multi‑EC rows)
+- Identity‑aware episodes: `identity_disjoint=true` with clusters from `paths.clusters_tsv`
+- EC hierarchy: `hierarchy_levels=2`, `hierarchy_weight=0.2`
 - Random seed: `42`
 
 Paths (relative):
@@ -115,10 +149,71 @@ Your mileage varies with data volume and CPU/GPU.
 
 ---
 
-## What this project intentionally **does not** do (to stay minimal)
-- No sequence identity clustering (this is a quick PC trial). 
-- No hierarchical EC modeling – we treat EC IDs as **flat classes** for now.
-- No heavy dependencies or distributed training.
+## Core Features
+- Identity‑aware episodes: enabled by default with `identity_disjoint: true`. Generate the clustering map via `scripts/cluster_sequences.py` using MMseqs2/CD‑HIT when available (Python fallback for small tests). Defaults: `cluster_identity: 0.5`, `cluster_coverage: 0.5`.
+- Multi‑EC support: enabled via `allow_multi_ec: true` (split expansion) and `multi_label: true` (BCE over episode classes). Episodic accuracy counts a prediction as correct if top‑1 is among true labels.
+- EC hierarchy: enabled via `hierarchy_levels` (1–3) and `hierarchy_weight` to add auxiliary losses at coarser EC levels using prototype grouping per episode.
+
+### HPC Modules (MMseqs2/CD-HIT)
+On module-managed clusters, load clustering tools before running the pipeline:
+```bash
+module load CD-HIT
+module load MMseqs2
+```
+The pipeline prefers MMseqs2, then CD-HIT; if neither is available on PATH, it falls back to a slow Python implementation for small tests.
+
+You can also declare modules in your config to have `run_all.sh` load them automatically:
+```yaml
+# config.yaml (or config.hpc.yaml)
+modules: [MMseqs2, CD-HIT]
+```
+This is optional; if the `module` command is unavailable, the script continues without loading.
+
+---
+
+## Identity-Constrained Benchmark (10/30/50/70/100)
+
+Goal: enforce that no test sequence shares more than X% identity with any training sequence by splitting at the cluster level, and report how performance changes as homology constraints tighten.
+
+- Prepare cluster-based splits for multiple cutoffs and K folds (default 5):
+  ```bash
+  python scripts/prepare_identity_splits.py -c config.yaml --cutoffs 0.1,0.3,0.5,0.7,1.0 --folds 5
+  ```
+  Writes per-cutoff, per-fold split dirs under `paths.splits_dir`:
+  `.../id10/fold0/{train,val,test}.jsonl`, `.../id30/fold0/...`, etc., and a cluster map per cutoff `data/identity/clusters_id{pct}.tsv`.
+
+- Run training + evaluation across all cutoffs and folds and aggregate metrics:
+  ```bash
+  python scripts/run_identity_benchmark.py -c config.yaml --cutoffs 0.1,0.3,0.5,0.7,1.0 --folds 5
+  ```
+  Outputs per-run results under `results/identity/id{pct}/fold{n}/` and a summary at:
+  `results/identity/benchmark.json` with mean/std per K across folds for each cutoff.
+
+Notes:
+- Splits are made by clusters, not individual sequences. Entire clusters go to the test fold, guaranteeing the specified identity ceiling between train and test (when MMseqs2/CD-HIT is available).
+- Episodic sampling can also enforce within-episode identity disjointness via `identity_disjoint: true` using the per-cutoff cluster map.
+
+### Metrics (Eval)
+- Single-label: accuracy, macro-precision/recall/F1.
+- Multi-label: top-1 hit accuracy (prediction counted correct if top-1 is among true labels) plus thresholded (0.5) micro/macro precision/recall/F1.
+
+### Fresh starts, selective clean, and force fetch
+- Show clean help and flags:
+  - `bash scripts/clean_all.sh --help`
+- Clean everything (destructive):
+  - `bash scripts/clean_all.sh --yes`
+- Selective clean (pick categories):
+  - Fetch data: `bash scripts/clean_all.sh --yes --fetch`
+  - Clusters: `bash scripts/clean_all.sh --yes --clusters`
+  - Embeddings: `bash scripts/clean_all.sh --yes --embeddings`
+  - Splits: `bash scripts/clean_all.sh --yes --splits`
+  - Results: `bash scripts/clean_all.sh --yes --results`
+- Skip/force embedding in the runner:
+  - Skip happens automatically if embeddings exist; force rebuild with `--force-embed`.
+- Always re‑download UniProt snapshot via config toggle `force_fetch: true` (run_all.sh forwards to the Python fetcher as `--force-download`).
+
+## What this project intentionally **does not** do by default
+- Heavy dependencies or distributed training beyond simple DataParallel for embedding.
 
 ---
 

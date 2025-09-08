@@ -18,9 +18,10 @@ episode:
 episodes:
   train: 1000
   val: 200
+  eval: 500
 
 # Embedding
-batch_size_embed: 64  # raise to 128–512 on A40 (use config.hpc.yaml)
+batch_size_embed: 64  # raise on GPUs; reduce on CPU
 max_seq_len: 1022     # full ESM2 context window
 fp16: true            # enable FP16 inference on GPU
 dynamic_batch: true   # reduce batch size automatically on OOM
@@ -31,6 +32,26 @@ verbose: false
 fp16_train: false           # AMP for ProtoNet head (usually not needed)
 eval_every: 100             # episodes between validations (auto if unset)
 episodes_per_val_check: 50  # validation episodes per check
+# Multi-label and hierarchy
+multi_label: true           # allow sequences with multiple ECs; uses BCE loss on queries
+hierarchy_levels: 2         # add auxiliary losses on EC levels (1..N), 0=off
+hierarchy_weight: 0.2       # total weight for auxiliary hierarchical losses
+# Identity-aware sampling (requires clusters_tsv)
+identity_disjoint: true     # keep support/query disjoint by cluster within class when true
+
+# Identity clustering (pipeline-generated)
+cluster_identity: 0.5       # sequence identity threshold for clustering (MMseqs2/CD-HIT if available)
+cluster_coverage: 0.5       # minimum coverage fraction for MMseqs2 clustering
+
+# Identity benchmark (multi-threshold CV)
+# Evaluate across multiple sequence-identity thresholds with cluster-level splits
+# and per-threshold reporting. See scripts/prepare_identity_splits.py and
+# scripts/run_identity_benchmark.py
+id_thresholds: [10, 30, 50, 70, 100]   # percentage values
+folds: 5
+identity_definition: tool_default      # one of: global_pairwise | local_pairwise | tool_default
+clustering_method: existing_id_cluster_module  # informational; tool actually used is auto-detected
+stratify_by: EC_top                    # one of: EC_top | EC_full | none
 
 # ProtoNet head
 projection_dim: 256
@@ -39,6 +60,10 @@ temperature: 10.0
 # Data filtering and splits
 min_sequences_per_class_for_train: 40  # classes with < this go to meta-test pool
 random_seed: 42
+allow_multi_ec: true        # expand multi-EC rows so accession appears under each EC
+
+# Fetch options
+force_fetch: false           # pass --force-download to fetcher to refresh data
 
 # Paths
 paths:
@@ -47,3 +72,6 @@ paths:
   embeddings: data/emb/embeddings.npz
   splits_dir: data/splits
   outputs: results
+  # Optional: TSV with two columns: accession\tcluster_id (for identity-aware sampling)
+  # e.g., produced by MMseqs2/CD-HIT clustering
+  clusters_tsv: data/identity/clusters.tsv

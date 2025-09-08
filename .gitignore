@@ -5,6 +5,8 @@ data/emb/
 data/splits/
 data/splits_*/
 data/**/_tmp/
+data/identity/_work*/
+data/identity/clusters*.tsv
 
 # Results (training/eval outputs)
 results/
@@ -26,12 +28,18 @@ dist/
 *.egg-info/
 .eggs/
 pip-wheel-metadata/
+.ruff_cache/
+.pyre/
+.pytype/
+.coverage.*
 
 # Virtual envs
 .venv/
 venv/
 env/
 .python-version
+.env
+.envrc
 
 # IDE / OS
 .vscode/
@@ -40,3 +48,29 @@ env/
 .DS_Store
 Thumbs.db
 .ipynb_checkpoints/
+.direnv/
+*.swp
+*.swo
+*~
+
+# Ignore temporary configs
+.tmp_configs/
+
+# HPC / job logs and common run artifacts
+slurm-*.out
+slurm-*.err
+slurm-*.log
+nohup.out
+
+# Optional experiment trackers (if used)
+wandb/
+mlruns/
+lightning_logs/
+events.out.tfevents*
+
+# Local overrides (do not commit)
+config.local.yaml
+config.*.local.yaml
+
+# Stray environment listing file seen in repo root
+eq

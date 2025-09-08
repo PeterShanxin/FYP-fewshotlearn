@@ -16,17 +16,18 @@
 PY ?= python
 CFG ?= config.yaml
 
-.PHONY: help install fetch split embed train eval all clean clean-data
+.PHONY: help install fetch split cluster embed train eval identity-splits identity-benchmark all clean clean-data
 
-help:
+	help:
 	@echo "Targets:"
 	@echo "  install     - pip install minimal dependencies"
 	@echo "  fetch       - download Swiss-Prot (reviewed+EC), snapshot, join TSV+FASTA"
-	@echo "  split       - build cluster-free meta-train/val/test splits by EC classes"
-	@echo "  embed       - compute ESM2-t12-35M mean-pooled embeddings (.npz)"
+	@echo "  split       - build EC class splits (multi-EC expanded)"
+	@echo "  cluster     - cluster sequences for identity-aware sampling (MMseqs2/CD-HIT/Python)"
+	@echo "  embed       - compute ESM2 mean-pooled embeddings (writes contiguous X.npy + keys.npy)"
 	@echo "  train       - episodic training of ProtoNet with early stopping"
 	@echo "  eval        - episodic meta-test evaluation (accuracy & macro-F1)"
-	@echo "  all         - fetch -> split -> embed -> train -> eval"
+	@echo "  all         - fetch -> split -> cluster -> embed -> train -> eval"
 	@echo "  clean       - remove Python caches"
 	@echo "  clean-data  - remove embeddings, splits, and results"
 	@echo ""
@@ -41,6 +42,9 @@ fetch:
 split:
 	$(PY) -m src.prepare_split -c $(CFG)
 
+cluster:
+	$(PY) scripts/cluster_sequences.py -c $(CFG)
+
 embed:
 	$(PY) -m src.embed_sequences -c $(CFG)
 
@@ -50,7 +54,16 @@ train:
 eval:
 	$(PY) -m src.eval_protonet -c $(CFG)
 
-all: fetch split embed train eval
+# Multi-threshold identity CV helpers
+identity-splits:
+	$(PY) scripts/prepare_identity_splits.py -c $(CFG)
+
+identity-benchmark:
+	$(PY) scripts/run_identity_benchmark.py -c $(CFG)
+
+# Auto-detect: if id_thresholds present, run identity benchmark; otherwise legacy path
+all:
+	bash scripts/run_all.sh $(CFG)
 
 clean:
 	rm -rf __pycache__ .pytest_cache **/__pycache__ *.pyc

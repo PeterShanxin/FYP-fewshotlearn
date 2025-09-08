@@ -16,6 +16,7 @@ episode:
 episodes:
   train: 5          # a handful of train episodes
   val: 2            # tiny validation
+  eval: 5           # tiny meta-test
 
 # Embedding runtime knobs
 batch_size_embed: 1
@@ -32,6 +33,27 @@ temperature: 10.0
 min_sequences_per_class_for_train: 2
 random_seed: 123
 
+# Turn on optional features for smoke; clusters are generated automatically
+multi_label: true
+hierarchy_levels: 1
+hierarchy_weight: 0.2
+identity_disjoint: true
+allow_multi_ec: true
+
+# Clustering defaults (auto)
+cluster_identity: 0.5
+cluster_coverage: 0.5
+
+# Identity benchmark defaults for smoke (fast)
+id_thresholds: [10, 50, 100]
+folds: 3
+identity_definition: tool_default
+clustering_method: existing_id_cluster_module
+stratify_by: EC_top
+
+# Fetch fresh data in smoke as well (small run)
+force_fetch: false
+
 # Limit the size of splits for smoke (applied in prepare_split)
 limit_classes: 5           # keep only top-N EC classes by count
 limit_per_class: 3         # and at most this many accessions per class
@@ -43,3 +65,4 @@ paths:
   embeddings: data/emb/embeddings_smoke.npz
   splits_dir: data/splits_smoke
   outputs: results/smoke
+  clusters_tsv: data/identity/clusters_smoke.tsv

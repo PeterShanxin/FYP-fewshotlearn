@@ -12,7 +12,7 @@ from typing import Dict, List
 import numpy as np
 import torch
 import yaml
-from sklearn.metrics import accuracy_score, f1_score
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from tqdm.auto import trange
 
 from .episodic_sampler import EpisodeSampler
@@ -40,7 +40,13 @@ def eval_for_K(
     episodes: int,
     show_progress: bool = True,
 ) -> Dict[str, float]:
-    ys, yh = [], []
+    ys, yh = [], []  # single-label
+    multi_label_mode = False
+    hits = 0
+    total = 0
+    # For multi-label thresholded metrics
+    y_true_ml: List[np.ndarray] = []
+    y_pred_ml: List[np.ndarray] = []
     with torch.no_grad():
         for _ in trange(
             episodes,
@@ -48,13 +54,49 @@ def eval_for_K(
             dynamic_ncols=True,
             disable=not show_progress,
         ):
-            sx, sy, qx, qy = sampler.sample_episode(M, K, Q)
-            pred = model.predict(sx, sy, qx)
-            ys.extend(qy.cpu().numpy().tolist())
-            yh.extend(pred.cpu().numpy().tolist())
+            sx, sy, qx, qy, _classes = sampler.sample_episode(M, K, Q)
+            logits, _ = model(sx, sy, qx, None)
+            pred = logits.argmax(dim=-1)
+            if qy.dim() == 2:
+                multi_label_mode = True
+                idx = pred.view(-1, 1)
+                take = torch.gather(qy, 1, idx).squeeze(1)
+                hits += int((take > 0.5).sum().item())
+                total += int(qy.shape[0])
+                # Thresholded multi-label predictions for PR/F1
+                probs = torch.sigmoid(logits)
+                y_pred_ml.append((probs >= 0.5).float().cpu().numpy())
+                y_true_ml.append(qy.float().cpu().numpy())
+            else:
+                ys.extend(qy.cpu().numpy().tolist())
+                yh.extend(pred.cpu().numpy().tolist())
+    if multi_label_mode:
+        acc = float(hits / max(total, 1))
+        Yt = np.vstack(y_true_ml) if y_true_ml else np.zeros((0, 0), dtype=np.float32)
+        Yp = np.vstack(y_pred_ml) if y_pred_ml else np.zeros((0, 0), dtype=np.float32)
+        # Micro/macro precision/recall/F1 with zero_division=0 for stability
+        micro_p = precision_score(Yt.reshape(-1), Yp.reshape(-1), zero_division=0)
+        micro_r = recall_score(Yt.reshape(-1), Yp.reshape(-1), zero_division=0)
+        micro_f1 = f1_score(Yt.reshape(-1), Yp.reshape(-1), zero_division=0)
+        # Macro over labels (average per class)
+        macro_p = precision_score(Yt, Yp, average="macro", zero_division=0)
+        macro_r = recall_score(Yt, Yp, average="macro", zero_division=0)
+        macro_f1 = f1_score(Yt, Yp, average="macro", zero_division=0)
+        return {
+            "acc_top1_hit": acc,
+            "micro_precision": float(micro_p),
+            "micro_recall": float(micro_r),
+            "micro_f1": float(micro_f1),
+            "macro_precision": float(macro_p),
+            "macro_recall": float(macro_r),
+            "macro_f1": float(macro_f1),
+        }
+    # Single-label metrics
     acc = accuracy_score(ys, yh)
+    p = precision_score(ys, yh, average="macro", zero_division=0)
+    r = recall_score(ys, yh, average="macro", zero_division=0)
     f1 = f1_score(ys, yh, average="macro", zero_division=0)
-    return {"acc": float(acc), "macro_f1": float(f1)}
+    return {"acc": float(acc), "macro_precision": float(p), "macro_recall": float(r), "macro_f1": float(f1)}
 
 
 def main() -> None:
@@ -68,7 +110,14 @@ def main() -> None:
     requested_gpus = int(cfg.get("gpus", 1))
 
     # Sampler and model init
-    test_sampler = EpisodeSampler(paths["embeddings"], Path(paths["splits_dir"]) / "test.jsonl", device, seed=cfg.get("random_seed", 42) + 2)
+    multi_label = bool(cfg.get("multi_label", False))
+    clusters_tsv = Path(paths.get("clusters_tsv", "")) if paths.get("clusters_tsv") else None
+    disjoint = bool(cfg.get("identity_disjoint", False))
+    test_sampler = EpisodeSampler(
+        Path(paths["embeddings"]), Path(paths["splits_dir"]) / "test.jsonl", device,
+        seed=cfg.get("random_seed", 42) + 2, multi_label=multi_label,
+        clusters_tsv=clusters_tsv, disjoint_support_query=disjoint,
+    )
     pcfg = ProtoConfig(input_dim=test_sampler.dim, projection_dim=int(cfg.get("projection_dim", 256)), temperature=float(cfg.get("temperature", 10.0)))
     model = ProtoNet(pcfg).to(device)
     if requested_gpus > 1 and device.type == "cuda":

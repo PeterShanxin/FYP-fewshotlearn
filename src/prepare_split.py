@@ -1,7 +1,8 @@
-"""Build simple, cluster-free meta-train/val/test splits by EC classes.
+"""Build simple, cluster-aware optional meta-train/val/test splits by EC classes.
 
 - Reads the joined TSV produced by scripts/fetch_uniprot_ec.sh
-- Keeps only single-EC rows for this minimal trial (drop multi-label)
+- By default, used to keep only single-EC rows (drop multi-label)
+- If allow_multi_ec=true, expands multi-EC rows so each accession appears under all its ECs
 - Groups by EC; classes with >= min_sequences_per_class_for_train form the base pool
 - Splits base pool classes 80/10/10 into meta-train/val/test (by classes, not by sequences)
 - Adds all underfilled classes (< min) into meta-test pool (by class)
@@ -28,6 +29,7 @@ class Config:
     splits_dir: Path
     min_per_class: int
     seed: int
+    allow_multi_ec: bool = False
     limit_classes: int | None = None
     limit_per_class: int | None = None
 
@@ -41,25 +43,45 @@ def load_config(path: str) -> Config:
         splits_dir=Path(paths["splits_dir"]),
         min_per_class=int(cfg["min_sequences_per_class_for_train"]),
         seed=int(cfg.get("random_seed", 42)),
+        allow_multi_ec=bool(cfg.get("allow_multi_ec", False)),
         limit_classes=(int(cfg.get("limit_classes")) if cfg.get("limit_classes") is not None else None),
         limit_per_class=(int(cfg.get("limit_per_class")) if cfg.get("limit_per_class") is not None else None),
     )
 
 
-def filter_single_ec(df: pd.DataFrame) -> pd.DataFrame:
+def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    # normalise column names
     df.columns = [c.lower() for c in df.columns]
     if "ec" not in df.columns:
         raise KeyError("'ec' column not found")
-    df = df[df["ec"].notna()]
     df = df[(df["ec"].notna()) & (df["ec"].astype(str).str.len() > 0)]
-    # keep only single-EC rows (no ';')
-    mask_single = ~df["ec"].astype(str).str.contains(";")
-    df = df[mask_single]
-    # strip spaces
     df["ec"] = df["ec"].astype(str).str.strip()
+    df["accession"] = df["accession"].astype(str)
     return df
+
+
+def filter_or_expand_ec(df: pd.DataFrame, allow_multi_ec: bool) -> pd.DataFrame:
+    """Either keep only single-EC rows or expand multi-EC rows into multiple rows.
+
+    When allow_multi_ec=True, an accession with "ec" like "1.1.1.1; 3.5.4.4" will
+    appear twice (once per EC) in the output. This enables multi-label training
+    while preserving a simple class→accessions mapping in the JSONL files.
+    """
+    df = normalize_df(df)
+    if not allow_multi_ec:
+        mask_single = ~df["ec"].astype(str).str.contains(";")
+        return df[mask_single]
+    # Expand to long format: one row per (accession, ec)
+    rows = []
+    for _, r in df.iterrows():
+        ecs = [e.strip() for e in str(r["ec"]).split(";") if e.strip()]
+        for ec in ecs:
+            rr = r.copy()
+            rr["ec"] = ec
+            rows.append(rr)
+    if not rows:
+        return df.iloc[0:0]
+    return pd.DataFrame(rows)[df.columns]
 
 
 def group_by_ec(df: pd.DataFrame) -> Dict[str, List[str]]:
@@ -126,6 +148,7 @@ def main() -> None:
                 splits_dir=str(cfg.splits_dir),
                 min_per_class=cfg.min_per_class,
                 seed=cfg.seed,
+                allow_multi_ec=cfg.allow_multi_ec,
                 limit_classes=cfg.limit_classes,
                 limit_per_class=cfg.limit_per_class,
             ),
@@ -139,7 +162,7 @@ def main() -> None:
         )
 
     df = pd.read_csv(cfg.joined_tsv, sep="\t")
-    df = filter_single_ec(df)
+    df = filter_or_expand_ec(df, allow_multi_ec=cfg.allow_multi_ec)
 
     # Optional downsampling for smoke tests: keep only top-N classes and at most
     # K sequences per class. This reduces embedding/training time drastically

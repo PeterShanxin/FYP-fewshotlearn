@@ -24,6 +24,11 @@ if errorlevel 1 (
 python -m src.prepare_split -c %CFG%
 if errorlevel 1 goto :error
 
+:: 2.5) Cluster sequences for identity-aware sampling
+echo [run_all] Clustering sequences for identity-aware sampling
+python scripts/cluster_sequences.py -c %CFG%
+if errorlevel 1 goto :error
+
 :: 3) Embed sequences
 python -m src.embed_sequences -c %CFG%
 if errorlevel 1 goto :error

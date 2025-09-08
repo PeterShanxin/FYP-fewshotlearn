@@ -58,6 +58,7 @@ def episodic_accuracy(
     Q: int,
     episodes: int,
     show_progress: bool = True,
+    multi_label: bool = False,
 ) -> float:
     correct = 0
     total = 0
@@ -71,10 +72,15 @@ def episodic_accuracy(
                 disable=not show_progress,
                 position=1,
             ):
-                sx, sy, qx, qy = val_sampler.sample_episode(M, K, Q)
+                sx, sy, qx, qy, _classes = val_sampler.sample_episode(M, K, Q)
                 pred = model.predict(sx, sy, qx)
-                correct += int((pred == qy).sum().item())
-                total += int(qy.numel())
+                if multi_label and qy.dim() == 2:
+                    take = torch.gather(qy, 1, pred.view(-1, 1)).squeeze(1)
+                    correct += int((take > 0.5).sum().item())
+                    total += int(qy.shape[0])
+                else:
+                    correct += int((pred == qy).sum().item())
+                    total += int(qy.numel())
     return correct / max(total, 1)
 
 
@@ -94,9 +100,33 @@ def main() -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(cfg.get("random_seed", 42))
 
+    # Options
+    multi_label = bool(cfg.get("multi_label", False))
+    clusters_tsv = Path(paths.get("clusters_tsv", "")) if paths.get("clusters_tsv") else None
+    disjoint = bool(cfg.get("identity_disjoint", False))
+
     # Samplers
-    train_sampler = EpisodeSampler(paths["embeddings"], Path(paths["splits_dir"]) / "train.jsonl", device, seed=cfg.get("random_seed", 42))
-    val_sampler   = EpisodeSampler(paths["embeddings"], Path(paths["splits_dir"]) / "val.jsonl", device, seed=cfg.get("random_seed", 42) + 1)
+    train_sampler = EpisodeSampler(
+        Path(paths["embeddings"]), Path(paths["splits_dir"]) / "train.jsonl", device,
+        seed=cfg.get("random_seed", 42), multi_label=multi_label,
+        clusters_tsv=clusters_tsv, disjoint_support_query=disjoint,
+    )
+    val_sampler   = EpisodeSampler(
+        Path(paths["embeddings"]), Path(paths["splits_dir"]) / "val.jsonl", device,
+        seed=cfg.get("random_seed", 42) + 1, multi_label=multi_label,
+        clusters_tsv=clusters_tsv, disjoint_support_query=disjoint,
+    )
+    # Detect empty val split to optionally skip validation
+    has_val = False
+    try:
+        val_path = Path(paths["splits_dir"]) / "val.jsonl"
+        if val_path.exists():
+            with open(val_path, "r", encoding="utf-8") as f:
+                for _ in f:
+                    has_val = True
+                    break
+    except Exception:
+        has_val = False
 
     # Model
     pcfg = ProtoConfig(input_dim=train_sampler.dim, projection_dim=int(cfg.get("projection_dim", 256)), temperature=float(cfg.get("temperature", 10.0)))
@@ -125,6 +155,9 @@ def main() -> None:
         "fp16_train": use_amp,
         "eval_every": eval_every,
         "episodes_per_val_check": episodes_per_val_check,
+        "multi_label": multi_label,
+        "identity_disjoint": disjoint,
+        "has_val": has_val,
     }, indent=2))
     if requested_gpus > 1 and device.type == "cuda":
         print("[train] Note: training runs on a single GPU; multi-GPU is used for embeddings only.")
@@ -140,23 +173,74 @@ def main() -> None:
         range(n_train), desc="episodes", dynamic_ncols=True, leave=True, disable=not show_progress
     )
     for ep in pbar:
-        sx, sy, qx, qy = train_sampler.sample_episode(M, K, Q)
+        sx, sy, qx, qy, classes = train_sampler.sample_episode(M, K, Q)
         if use_amp:
             with torch.cuda.amp.autocast(dtype=torch.float16):
                 logits, loss = model(sx, sy, qx, qy)
+                # Optional hierarchical supervision over EC levels
+                hier_levels = int(cfg.get("hierarchy_levels", 0))
+                hier_w = float(cfg.get("hierarchy_weight", 0.0))
+                if hier_levels > 0 and hier_w > 0.0:
+                    s = model.embed(sx)
+                    q = model.embed(qx)
+                    use_lvls = [lvl for lvl in range(1, min(hier_levels, 3) + 1)]
+                    per_w = hier_w / max(len(use_lvls), 1)
+                    for lvl in use_lvls:
+                        parts = [ec.split('.') for ec in classes]
+                        coarse = ['.'.join(p[:lvl]) for p in parts]
+                        uniq = {t: i for i, t in enumerate(sorted(set(coarse)))}
+                        if len(uniq) < 2:
+                            continue
+                        y_coarse = torch.tensor([uniq[coarse[int(y.item())]] for y in sy], dtype=torch.long, device=device)
+                        P_c = model.prototypes(s, y_coarse)
+                        logits_c = (q @ P_c.T) / model.temp
+                        if multi_label and qy.dim() == 2:
+                            q_c = torch.zeros((qy.shape[0], len(uniq)), dtype=torch.float32, device=device)
+                            for j, t in enumerate(coarse):
+                                gid = uniq[t]
+                                q_c[:, gid] = torch.maximum(q_c[:, gid], qy[:, j])
+                            loss = loss + per_w * torch.nn.functional.binary_cross_entropy_with_logits(logits_c, q_c)
+                        else:
+                            yq_c = torch.tensor([uniq[coarse[int(y.item())]] for y in qy], dtype=torch.long, device=device)
+                            loss = loss + per_w * torch.nn.functional.cross_entropy(logits_c, yq_c)
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
         else:
             logits, loss = model(sx, sy, qx, qy)
+            hier_levels = int(cfg.get("hierarchy_levels", 0))
+            hier_w = float(cfg.get("hierarchy_weight", 0.0))
+            if hier_levels > 0 and hier_w > 0.0:
+                s = model.embed(sx)
+                q = model.embed(qx)
+                use_lvls = [lvl for lvl in range(1, min(hier_levels, 3) + 1)]
+                per_w = hier_w / max(len(use_lvls), 1)
+                for lvl in use_lvls:
+                    parts = [ec.split('.') for ec in classes]
+                    coarse = ['.'.join(p[:lvl]) for p in parts]
+                    uniq = {t: i for i, t in enumerate(sorted(set(coarse)))}
+                    if len(uniq) < 2:
+                        continue
+                    y_coarse = torch.tensor([uniq[coarse[int(y.item())]] for y in sy], dtype=torch.long, device=device)
+                    P_c = model.prototypes(s, y_coarse)
+                    logits_c = (q @ P_c.T) / model.temp
+                    if multi_label and qy.dim() == 2:
+                        q_c = torch.zeros((qy.shape[0], len(uniq)), dtype=torch.float32, device=device)
+                        for j, t in enumerate(coarse):
+                            gid = uniq[t]
+                            q_c[:, gid] = torch.maximum(q_c[:, gid], qy[:, j])
+                        loss = loss + per_w * torch.nn.functional.binary_cross_entropy_with_logits(logits_c, q_c)
+                    else:
+                        yq_c = torch.tensor([uniq[coarse[int(y.item())]] for y in qy], dtype=torch.long, device=device)
+                        loss = loss + per_w * torch.nn.functional.cross_entropy(logits_c, yq_c)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
 
-        if (ep + 1) % eval_every == 0 or ep == n_train - 1:
+        if has_val and ((ep + 1) % eval_every == 0 or ep == n_train - 1):
             acc = episodic_accuracy(
-                model, val_sampler, M, K, Q, episodes=min(episodes_per_val_check, n_val_eval), show_progress=show_progress
+                model, val_sampler, M, K, Q, episodes=min(episodes_per_val_check, n_val_eval), show_progress=show_progress, multi_label=multi_label
             )
             history["val_acc"].append(acc)
             history["checkpoints_after_episode"].append(ep + 1)

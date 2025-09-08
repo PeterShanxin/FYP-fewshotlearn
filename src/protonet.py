@@ -72,7 +72,13 @@ class ProtoNet(nn.Module):
         logits = (q @ P.T) / self.temp     # [|Q|, M]
         loss = None
         if query_y is not None:
-            loss = F.cross_entropy(logits, query_y)
+            # Multi-task: if query_y is 2D (multi-hot) → BCEWithLogits; else CE
+            if query_y.dim() == 2:
+                # BCE expects float targets in {0,1}
+                target = query_y.float()
+                loss = F.binary_cross_entropy_with_logits(logits, target)
+            else:
+                loss = F.cross_entropy(logits, query_y)
         return logits, loss
 
     @torch.inference_mode()

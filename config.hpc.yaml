@@ -13,6 +13,12 @@ embedding:
 # Device selection: "auto" → cuda if available else cpu
 device: auto
 
+# Optional: load HPC environment modules before running
+# Adjust names/versions to your cluster (e.g., MMseqs2/14, cd-hit/4.8.1)
+modules:
+  - MMseqs2
+  - CD-HIT
+
 # Episode settings (few-shot task shape)
 episode:
   M: 10              # ways
@@ -43,9 +49,32 @@ fp16_train: false            # AMP for ProtoNet head (gains minimal; keep FP32)
 eval_every: 1000             # validate every 1k episodes (10 checks across 10k)
 episodes_per_val_check: 200  # 200-episode validation slices (faster interim CIs)
 
+# Multi-label and hierarchy
+multi_label: true             # allow sequences with multiple ECs; uses BCE loss on queries
+hierarchy_levels: 2           # add auxiliary losses on EC levels (1..N), 0=off
+hierarchy_weight: 0.2         # total weight for auxiliary hierarchical losses
+
+# Identity-aware sampling (requires clusters_tsv)
+identity_disjoint: true       # keep support/query disjoint by cluster within class when true
+
+# Identity clustering (pipeline-generated)
+cluster_identity: 0.5         # sequence identity threshold for clustering
+cluster_coverage: 0.5         # minimum coverage fraction for MMseqs2 clustering
+
+# Identity benchmark (multi-threshold CV)
+id_thresholds: [10, 30, 50, 70, 100]
+folds: 5
+identity_definition: tool_default      # global_pairwise | local_pairwise | tool_default
+clustering_method: existing_id_cluster_module
+stratify_by: EC_top
+
 # Data filtering and splits
 min_sequences_per_class_for_train: 40
 random_seed: 42
+allow_multi_ec: true
+
+# Fetch
+force_fetch: false
 
 # Paths
 paths:
@@ -54,3 +83,5 @@ paths:
   embeddings: data/emb/embeddings.npz
   splits_dir: data/splits
   outputs: results
+  # Optional clustering map for identity-aware sampling: accession\tcluster_id
+  clusters_tsv: data/identity/clusters.tsv

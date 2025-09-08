@@ -12,7 +12,7 @@ import json
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Set, DefaultDict
+from typing import Dict, List, Tuple, Optional, Set, DefaultDict, Mapping
 from collections import defaultdict
 
 import numpy as np
@@ -47,6 +47,8 @@ class EpisodeSampler:
       used for identity-aware disjoint sampling of support/query pools.
     - disjoint_support_query: if True and clusters are provided, queries are
       preferentially drawn from clusters not used for supports within each class.
+    - mmap_legacy: if True, legacy NPZ arrays are memory-mapped/lazily loaded
+      instead of materializing all embeddings in memory.
     """
 
     def __init__(
@@ -59,11 +61,26 @@ class EpisodeSampler:
         multi_label: bool = False,
         clusters_tsv: Optional[Path] = None,
         disjoint_support_query: bool = False,
+        mmap_legacy: bool = False,
     ) -> None:
+        """Initialize the episodic sampler.
+
+        Args:
+            embeddings_npz: NPZ archive of embeddings.
+            split_jsonl: JSONL file describing class splits.
+            device: Target device for returned tensors.
+            seed: RNG seed.
+            multi_label: Enable multi-EC targets for queries.
+            clusters_tsv: Optional accession-to-cluster mapping.
+            disjoint_support_query: Prefer disjoint clusters for support/query.
+            mmap_legacy: Lazily load legacy NPZ arrays instead of preloading
+                all embeddings into memory.
+        """
         self.device = device
         self.rng = random.Random(seed)
         self.multi_label = bool(multi_label)
         self.disjoint_support_query = bool(disjoint_support_query)
+        self.mmap_legacy = bool(mmap_legacy)
 
         # Normalize paths and detect contiguous format alongside the configured NPZ path
         emb_path = Path(embeddings_npz)
@@ -74,7 +91,7 @@ class EpisodeSampler:
         keys_path = Path(base_str + ".keys.npy")
 
         self._use_mmap = False
-        self.emb_map: Dict[str, np.ndarray] = {}
+        self.emb_map: Mapping[str, np.ndarray] = {}
 
         if X_path.exists() and keys_path.exists():
             # Fast path: memory-map contiguous array and build index
@@ -90,13 +107,24 @@ class EpisodeSampler:
             self.key2row: Dict[str, int] = {k: i for i, k in enumerate(self.keys.tolist())}  # type: ignore[attr-defined]
             self.dim = int(self.X.shape[1])
         else:
-            # Legacy NPZ path: load arrays into a dict with a visible progress bar
+            # Legacy NPZ path: load arrays either lazily or into memory
             print(f"[load-emb] using legacy NPZ: {emb_path}")
-            npz = np.load(emb_path, allow_pickle=False)
-            self.emb_map = {}
-            for k in tqdm(npz.files, desc="[load-emb] npz", dynamic_ncols=True):
-                self.emb_map[k] = npz[k]
-            any_vec = next(iter(self.emb_map.values())) if self.emb_map else np.zeros(1, dtype=np.float32)
+            if self.mmap_legacy:
+                self.emb_map = np.load(emb_path, allow_pickle=False, mmap_mode="r")  # type: ignore[assignment]
+                any_vec = (
+                    self.emb_map[self.emb_map.files[0]]
+                    if getattr(self.emb_map, "files", [])
+                    else np.zeros(1, dtype=np.float32)
+                )
+                avail = set(self.emb_map.files)
+            else:
+                npz = np.load(emb_path, allow_pickle=False)
+                embs: Dict[str, np.ndarray] = {}
+                for k in tqdm(npz.files, desc="[load-emb] npz", dynamic_ncols=True):
+                    embs[k] = npz[k]
+                self.emb_map = embs
+                avail = set(embs.keys())
+                any_vec = next(iter(embs.values())) if embs else np.zeros(1, dtype=np.float32)
             self.dim = int(any_vec.shape[0])
 
         # Build split index and per-class pools using either indices or accessions
@@ -113,7 +141,7 @@ class EpisodeSampler:
         else:
             self.class2acc: Dict[str, List[str]] = {}
             for ec, accs in self.split.by_class.items():
-                self.class2acc[ec] = [a for a in accs if a in self.emb_map]
+                self.class2acc[ec] = [a for a in accs if a in avail]
 
         # Optional: load clusters for identity-aware sampling
         self.acc2cluster: Dict[str, str] = {}

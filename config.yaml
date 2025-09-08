@@ -1,69 +1,80 @@
-# Central configuration for the minimal FSL-EC project
+# High-throughput, multi-GPU (A40 48GB) configuration
+
+# Number of GPUs to use when available (embedding step is multi-GPU aware).
+# Training/eval of ProtoNet remain single-GPU as they operate on episodic batches
+# with support/query coupling that doesn't trivially shard.
+gpus: 2
 
 embedding:
-  model: esm2_t12_35M_UR50D  # ESM2-t12-35M (UR50D)
-  # limit removed for full run (set 'limit: 1000' temporarily for smoke tests)
+  # Larger ESM2 backbone for better representations
+  # Options: esm2_t33_650M_UR50D, esm2_t36_3B_UR50D (3B likely too large for 48GB)
+  model: esm2_t33_650M_UR50D
 
 # Device selection: "auto" → cuda if available else cpu
 device: auto
 
-# Episode settings
+# Optional: load HPC environment modules before running
+# Adjust names/versions to your cluster (e.g., MMseqs2/14, cd-hit/4.8.1)
+modules:
+  - MMseqs2
+  - CD-HIT
+
+# Episode settings (few-shot task shape)
 episode:
   M: 10              # ways
   K_train: 5         # shots for training episodes
-  K_eval: [1, 5]     # shots for evaluation episodes
+  K_eval: [1, 5]     # shots evaluated on test episodes
   Q: 10              # queries per class
 
-# Number of episodes
+# Episode counts (raise for tighter confidence intervals)
 episodes:
-  train: 1000
-  val: 200
-  eval: 500
+  train: 10000       # 5k–20k recommended; start with 10k
+  val: 2000          # increase validation episodes
+  eval: 5000         # meta-test episodes for tight CIs
 
-# Embedding
-batch_size_embed: 64  # raise on GPUs; reduce on CPU
-max_seq_len: 1022     # full ESM2 context window
-fp16: true            # enable FP16 inference on GPU
-dynamic_batch: true   # reduce batch size automatically on OOM
+# Embedding runtime knobs (optimize throughput)
+batch_size_embed: 1536   # 2x A40 with FP16+DP; dynamic_batch adapts on OOM
+max_seq_len: 1022        # full ESM2 context window
+fp16: true               # use FP16 inference on GPU
+dynamic_batch: true      # auto-reduce batch on OOM
 progress: true
 verbose: false
-
-# Training knobs
-fp16_train: false           # AMP for ProtoNet head (usually not needed)
-eval_every: 100             # episodes between validations (auto if unset)
-episodes_per_val_check: 50  # validation episodes per check
-# Multi-label and hierarchy
-multi_label: true           # allow sequences with multiple ECs; uses BCE loss on queries
-hierarchy_levels: 2         # add auxiliary losses on EC levels (1..N), 0=off
-hierarchy_weight: 0.2       # total weight for auxiliary hierarchical losses
-# Identity-aware sampling (requires clusters_tsv)
-identity_disjoint: true     # keep support/query disjoint by cluster within class when true
-
-# Identity clustering (pipeline-generated)
-cluster_identity: 0.5       # sequence identity threshold for clustering (MMseqs2/CD-HIT if available)
-cluster_coverage: 0.5       # minimum coverage fraction for MMseqs2 clustering
-
-# Identity benchmark (multi-threshold CV)
-# Evaluate across multiple sequence-identity thresholds with cluster-level splits
-# and per-threshold reporting. See scripts/prepare_identity_splits.py and
-# scripts/run_identity_benchmark.py
-id_thresholds: [10, 30, 50, 70, 100]   # percentage values
-folds: 5
-identity_definition: tool_default      # one of: global_pairwise | local_pairwise | tool_default
-clustering_method: existing_id_cluster_module  # informational; tool actually used is auto-detected
-stratify_by: EC_top                    # one of: EC_top | EC_full | none
 
 # ProtoNet head
 projection_dim: 256
 temperature: 10.0
 
-# Data filtering and splits
-min_sequences_per_class_for_train: 40  # classes with < this go to meta-test pool
-random_seed: 42
-allow_multi_ec: true        # expand multi-EC rows so accession appears under each EC
+# Training knobs
+fp16_train: false            # AMP for ProtoNet head (gains minimal; keep FP32)
+eval_every: 1000             # validate every 1k episodes (10 checks across 10k)
+episodes_per_val_check: 200  # 200-episode validation slices (faster interim CIs)
 
-# Fetch options
-force_fetch: false           # pass --force-download to fetcher to refresh data
+# Multi-label and hierarchy
+multi_label: true             # allow sequences with multiple ECs; uses BCE loss on queries
+hierarchy_levels: 2           # add auxiliary losses on EC levels (1..N), 0=off
+hierarchy_weight: 0.2         # total weight for auxiliary hierarchical losses
+
+# Identity-aware sampling (requires clusters_tsv)
+identity_disjoint: true       # keep support/query disjoint by cluster within class when true
+
+# Identity clustering (pipeline-generated)
+cluster_identity: 0.5         # sequence identity threshold for clustering
+cluster_coverage: 0.5         # minimum coverage fraction for MMseqs2 clustering
+
+# Identity benchmark (multi-threshold CV)
+id_thresholds: [10, 30, 50, 70, 100]
+folds: 5
+identity_definition: tool_default      # global_pairwise | local_pairwise | tool_default
+clustering_method: existing_id_cluster_module
+stratify_by: EC_top
+
+# Data filtering and splits
+min_sequences_per_class_for_train: 40
+random_seed: 42
+allow_multi_ec: true
+
+# Fetch
+force_fetch: false
 
 # Paths
 paths:
@@ -72,6 +83,5 @@ paths:
   embeddings: data/emb/embeddings.npz
   splits_dir: data/splits
   outputs: results
-  # Optional: TSV with two columns: accession\tcluster_id (for identity-aware sampling)
-  # e.g., produced by MMseqs2/CD-HIT clustering
+  # Optional clustering map for identity-aware sampling: accession\tcluster_id
   clusters_tsv: data/identity/clusters.tsv

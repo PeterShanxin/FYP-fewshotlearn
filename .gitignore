@@ -39,7 +39,9 @@ venv/
 env/
 .python-version
 .env
+.env.*
 .envrc
+!.env.example
 
 # IDE / OS
 .vscode/
@@ -61,6 +63,7 @@ slurm-*.out
 slurm-*.err
 slurm-*.log
 nohup.out
+logs/
 
 # Optional experiment trackers (if used)
 wandb/
@@ -74,3 +77,11 @@ config.*.local.yaml
 
 # Stray environment listing file seen in repo root
 eq
+
+# Generic editor backup/patch files
+*.bak
+*.orig
+*.rej
+
+# Common ad-hoc temp dirs at repo root
+tmp/

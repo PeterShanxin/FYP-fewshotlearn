@@ -1,5 +1,8 @@
 # Smoke-test configuration: tiny, fast, CPU-friendly
 
+# Explicitly disable GPU usage to keep smoke runs on CPU
+gpus: 0
+
 embedding:
   model: esm2_t12_35M_UR50D
 
@@ -45,6 +48,7 @@ cluster_identity: 0.5
 cluster_coverage: 0.5
 
 # Identity benchmark defaults for smoke (fast)
+# Required: list of one or more thresholds (percent or fractions)
 id_thresholds: [10, 50, 100]
 folds: 3
 identity_definition: tool_default

@@ -16,7 +16,7 @@
 PY ?= python
 CFG ?= config.yaml
 
-.PHONY: help install fetch split cluster embed train eval identity-splits identity-benchmark all clean clean-data
+.PHONY: help install fetch split cluster embed train eval identity-splits identity-benchmark visualize all clean clean-data
 
 	help:
 	@echo "Targets:"
@@ -27,7 +27,8 @@ CFG ?= config.yaml
 	@echo "  embed       - compute ESM2 mean-pooled embeddings (writes contiguous X.npy + keys.npy)"
 	@echo "  train       - episodic training of ProtoNet with early stopping"
 	@echo "  eval        - episodic meta-test evaluation (accuracy & macro-F1)"
-	@echo "  all         - fetch -> split -> cluster -> embed -> train -> eval"
+	@echo "  visualize   - plot multi-threshold results (if summary exists)"
+	@echo "  all         - orchestrated run (prepare identity splits + benchmark + visualize)"
 	@echo "  clean       - remove Python caches"
 	@echo "  clean-data  - remove embeddings, splits, and results"
 	@echo ""
@@ -60,6 +61,14 @@ identity-splits:
 
 identity-benchmark:
 	$(PY) scripts/run_identity_benchmark.py -c $(CFG)
+
+visualize:
+	@if [ -f results/summary_by_id_threshold.json ]; then \
+		$(PY) scripts/visualize_identity_benchmark.py --results_dir results --out_dir results/figures || \
+		echo "[viz][note] matplotlib missing or plotting failed; skipping" ; \
+	else \
+		echo "[viz][note] results/summary_by_id_threshold.json not found; run the benchmark first" ; \
+	fi
 
 # Auto-detect: if id_thresholds present, run identity benchmark; otherwise legacy path
 all:

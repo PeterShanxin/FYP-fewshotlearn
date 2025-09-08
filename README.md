@@ -63,14 +63,50 @@ python -m src.eval_protonet -c config.yaml
 Writes `results/metrics.json` keyed by K. In multi‑label mode: top‑1 hit accuracy (prediction counted correct if top‑1 is among true labels) plus micro/macro precision/recall/F1. In single‑label mode: accuracy and macro‑F1.
 
 ### One‑liners
-- Unix/macOS:
+
+- **Unix/macOS** (default config):
   ```bash
-  bash scripts/run_all.sh
+  bash scripts/run_all.sh config.yaml
   ```
-- Windows (PowerShell/CMD):
+  Or for a quick smoke test:
+  ```bash
+  bash scripts/run_all.sh config.smoke.yaml
+  ```
+
+- **Windows (PowerShell/CMD)** (default config):
   ```bat
-  scripts\run_all.bat
+  scripts\run_all.bat config.yaml
   ```
+  Or for a smoke test:
+  ```bat
+  scripts\run_all.bat config.smoke.yaml
+  ```
+
+Replace `config.yaml` with any other config file as needed.
+
+## EDA: EC Distribution Overview
+Explore the distribution of EC numbers fetched from UniProt (hierarchical EC1→EC4):
+
+Run EDA (CSV summaries only by default):
+```bash
+python scripts/eda_uniprot_ec.py \
+  --data-root data/uniprot_ec \
+  --out-dir results/eda_uniprot_ec \
+  --no-timestamp
+```
+
+Optional plotting dependencies:
+- `pip install matplotlib plotly`
+
+Artifacts in `results/eda_uniprot_ec/`:
+- `counts_ec1.csv`, `counts_ec12.csv`, `counts_ec123.csv`, `counts_ec_full.csv`
+- `summary_stats.json` (totals, unique accessions, multi‑EC ratio)
+- If matplotlib is installed: `ec1_distribution.png`, `top_ec_full.png`, `heatmap_ec1_ec2.png`, `heatmap_ec2_ec3.png`
+- If plotly is installed: `sunburst_ec_hierarchy.html` (hierarchical “4‑digit” view), `sankey_ec_flow.html` (EC1→EC4 flow)
+
+Notes:
+- Unknown digits (`-` or empty) are normalized to `NA` to appear explicitly in plots.
+- The EDA expects `data/uniprot_ec/swissprot_ec_joined_long.tsv` created by the fetch step.
 
 ## Common Workflows
 - Reuse embeddings, retrain only: clean results then train+eval.
@@ -120,7 +156,7 @@ Paths (relative):
 ---
 
 ## HPC Profile (A40 48GB)
-- Use `config.hpc.yaml` to leverage a single NVIDIA A40 (48GB) and a multi-core CPU.
+- Use `config.yaml` to leverage a single NVIDIA A40 (48GB) and a multi-core CPU.
 - Key changes vs. default:
   - ESM model: `esm2_t33_650M_UR50D` (larger, better quality)
   - Embedding: `batch_size_embed=512`, `fp16: true`, `max_seq_len: 1022`, `dynamic_batch: true`
@@ -131,7 +167,7 @@ Paths (relative):
 
 Run the full pipeline with the HPC config:
 ```
-bash scripts/run_all.sh config.hpc.yaml
+bash scripts/run_all.sh config.yaml
 ```
 
 Notes:
@@ -164,7 +200,7 @@ The pipeline prefers MMseqs2, then CD-HIT; if neither is available on PATH, it f
 
 You can also declare modules in your config to have `run_all.sh` load them automatically:
 ```yaml
-# config.yaml (or config.hpc.yaml)
+# config.yaml
 modules: [MMseqs2, CD-HIT]
 ```
 This is optional; if the `module` command is unavailable, the script continues without loading.
@@ -175,27 +211,65 @@ This is optional; if the `module` command is unavailable, the script continues w
 
 Goal: enforce that no test sequence shares more than X% identity with any training sequence by splitting at the cluster level, and report how performance changes as homology constraints tighten.
 
-- Prepare cluster-based splits for multiple cutoffs and K folds (default 5):
+- Config-driven run (recommended): set a list of thresholds in `config.yaml` and run the pipeline.
+  ```yaml
+  # config.yaml
+  id_thresholds: [10, 30, 50, 70, 100]
+  folds: 5
+  ```
+  ```bash
+  bash scripts/run_all.sh config.yaml
+  ```
+  This orchestrates split prep + per-threshold training/eval and writes per-threshold results to `results/split-{pct}/fold-{i}/` along with `results/summary_by_id_threshold.json` (mean, std, and 95% CI per K across folds).
+
+- Manual run (equivalent):
   ```bash
   python scripts/prepare_identity_splits.py -c config.yaml --cutoffs 0.1,0.3,0.5,0.7,1.0 --folds 5
-  ```
-  Writes per-cutoff, per-fold split dirs under `paths.splits_dir`:
-  `.../id10/fold0/{train,val,test}.jsonl`, `.../id30/fold0/...`, etc., and a cluster map per cutoff `data/identity/clusters_id{pct}.tsv`.
-
-- Run training + evaluation across all cutoffs and folds and aggregate metrics:
-  ```bash
   python scripts/run_identity_benchmark.py -c config.yaml --cutoffs 0.1,0.3,0.5,0.7,1.0 --folds 5
   ```
-  Outputs per-run results under `results/identity/id{pct}/fold{n}/` and a summary at:
-  `results/identity/benchmark.json` with mean/std per K across folds for each cutoff.
+  Outputs:
+  - Per-threshold directories: `results/split-10/`, `results/split-30/`, ... each containing:
+    - `fold-1/..fold-5/metrics.json` (per-fold enriched metrics)
+    - `aggregate.json` (fold-aggregated metrics for that threshold)
+  - Cross-threshold summary: `results/summary_by_id_threshold.json`
 
 Notes:
 - Splits are made by clusters, not individual sequences. Entire clusters go to the test fold, guaranteeing the specified identity ceiling between train and test (when MMseqs2/CD-HIT is available).
-- Episodic sampling can also enforce within-episode identity disjointness via `identity_disjoint: true` using the per-cutoff cluster map.
+- Episodic sampling also enforces within-episode identity disjointness when `identity_disjoint: true` (uses the same cluster map).
 
 ### Metrics (Eval)
 - Single-label: accuracy, macro-precision/recall/F1.
 - Multi-label: top-1 hit accuracy (prediction counted correct if top-1 is among true labels) plus thresholded (0.5) micro/macro precision/recall/F1.
+
+### Visualization
+Generate figures and a short textual summary from the multi-threshold results.
+
+Requirements:
+- `pip install matplotlib`
+
+Usage:
+```bash
+python scripts/visualize_identity_benchmark.py \
+  --results_dir results \
+  --out_dir results/figures \
+  --dpi 150
+```
+
+Also:
+- `bash scripts/run_all.sh config.yaml` automatically runs visualization after the benchmark when the summary exists and matplotlib is installed.
+- `make visualize` runs the plotting step manually (non-fatal if the summary is missing). The PDF is generated by default; pass `--no-pdf` to the script to disable.
+
+Outputs (`--out_dir`):
+- `accuracy_vs_threshold.png` (K=1 and K=5, mean ± 95% CI)
+- `macro_f1_vs_threshold.png`, `micro_f1_vs_threshold.png`
+- `macro_precision_vs_threshold.png`, `macro_recall_vs_threshold.png`
+- `clusters_vs_threshold.png` (#clusters by threshold)
+- `accuracy_boxplot_by_threshold.png` (per-fold distributions)
+- `identity_benchmark_report.pdf` (bundled multi-page PDF with summary + all plots)
+
+Interpretation tips:
+- Accuracy generally increases with higher identity thresholds (task becomes easier as train/test are more similar); K=5 tends to outperform K=1.
+- In multi-label mode, recall is typically very high while precision is low at a fixed 0.5 sigmoid threshold; consider threshold tuning if precision is critical.
 
 ### Fresh starts, selective clean, and force fetch
 - Show clean help and flags:

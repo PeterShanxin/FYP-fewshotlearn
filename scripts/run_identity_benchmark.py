@@ -43,6 +43,7 @@ def main() -> None:
     ap.add_argument("--cutoffs", default="0.1,0.3,0.5,0.7,1.0")
     ap.add_argument("--folds", type=int, default=5)
     ap.add_argument("--skip_prepare", action="store_true", help="Assume splits already prepared")
+    ap.add_argument("--force-embed", dest="force_embed", action="store_true", help="Recompute embeddings even if files exist")
     args = ap.parse_args()
 
     base_cfg = load_cfg(args.config)
@@ -103,7 +104,7 @@ def main() -> None:
             base = emb_base[:-4] if emb_base.endswith('.npz') else emb_base
             Xp = Path(base + ".X.npy")
             Kp = Path(base + ".keys.npy")
-            if not (Xp.exists() and Kp.exists()):
+            if args.force_embed or not (Xp.exists() and Kp.exists()):
                 try:
                     run(["python", "-m", "src.embed_sequences", "-c", str(cfg_path)])
                 except subprocess.CalledProcessError:

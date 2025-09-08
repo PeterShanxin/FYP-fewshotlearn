@@ -120,21 +120,6 @@ print(str(bool(cfg.get('force_fetch', False))).lower())
 PY
 )
 
-# Autodetect identity CV (multi-threshold) from config
-IDENTITY_CV=$(python - "${CFG}" <<'PY'
-import sys, yaml
-with open(sys.argv[1], 'r') as f:
-    cfg = yaml.safe_load(f)
-ths = cfg.get('id_thresholds', [])
-enabled = False
-try:
-    enabled = isinstance(ths, (list, tuple)) and len(ths) > 0
-except Exception:
-    enabled = False
-print(str(bool(enabled)).lower())
-PY
-)
-
 # Respect gpus from config by setting CUDA_VISIBLE_DEVICES if not already set
 if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
   GPUS=$(python - "${CFG}" <<'PY'
@@ -168,57 +153,51 @@ else
 	bash scripts/fetch_uniprot_ec.sh
 fi
 
-# If identity CV enabled, run multi-threshold benchmark path and exit
-if [ "$IDENTITY_CV" = "true" ]; then
-  echo "[run_all] Identity CV detected (id_thresholds present). Running multi-threshold benchmark."
-  python scripts/prepare_identity_splits.py -c "${CFG}"
-  python scripts/run_identity_benchmark.py -c "${CFG}"
-  completed=1
-  exit 0
-fi
-
-# Otherwise, run the legacy single-threshold path
-# 2) Prepare splits
-python -m src.prepare_split -c "${CFG}"
-
-# 2.5) Cluster sequences at 50% identity (configurable) to create accession->cluster TSV
-echo "[run_all] Clustering sequences for identity-aware sampling"
-python scripts/cluster_sequences.py -c "${CFG}"
-
-# 3) Embed sequences (skip if embeddings already exist unless --force-embed)
 # Improve CUDA allocation behavior for large batches/models
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# Detect existing embeddings (contiguous X.npy + keys.npy or legacy NPZ)
-EMB_BASE=$(python - "${CFG}" <<'PY'
-import sys, yaml, os
-with open(sys.argv[1],'r') as f:
-    cfg = yaml.safe_load(f)
-p = cfg['paths']['embeddings']
-print(p[:-4] if p.endswith('.npz') else p)
-PY
-)
-EMB_X="${EMB_BASE}.X.npy"
-EMB_K="${EMB_BASE}.keys.npy"
-EMB_NPZ=$(python - "${CFG}" <<'PY'
+# Identity benchmark (single or multi) based solely on id_thresholds in config
+read -r CUTOFFS CUTOFFS_PCT_STR FOLDS MULTI <<EOF
+$(python - "${CFG}" <<'PY'
 import sys, yaml
-with open(sys.argv[1],'r') as f:
+with open(sys.argv[1], 'r') as f:
     cfg = yaml.safe_load(f)
-print(cfg['paths']['embeddings'])
+ths = cfg.get('id_thresholds')
+cuts = None
+if isinstance(ths, (list, tuple)) and len(ths) > 0:
+    try:
+        vals = [float(x) for x in ths]
+        cuts = [v/100.0 for v in vals] if max(vals) > 1 else vals
+    except Exception:
+        cuts = None
+folds = cfg.get('folds')
+try:
+    folds = int(folds) if folds is not None else 5
+except Exception:
+    folds = 5
+if not cuts:
+    print('NA NA', folds, 0)
+else:
+    pct_str = ",".join(str(int(round(c*100))) for c in cuts)
+    dec_str = ",".join(str(c) for c in cuts)
+    multi = '1' if len(cuts) > 1 else '0'
+    print(dec_str, pct_str, folds, multi)
 PY
 )
+EOF
 
-if [ "$FORCE_EMBED" -eq 0 ] && { { [ -f "$EMB_X" ] && [ -f "$EMB_K" ]; } || [ -f "$EMB_NPZ" ]; }; then
-  echo "[run_all] Skipping embed: found existing embeddings at $EMB_X / $EMB_K or $EMB_NPZ"
-else
-  python -m src.embed_sequences -c "${CFG}"
+if [ "$CUTOFFS" = "NA" ]; then
+  echo "[run_all][error] 'id_thresholds' is missing or invalid in ${CFG}. Set, e.g.: id_thresholds: [50] or [10,30,50,70,100]" >&2
+  exit 2
 fi
 
-# 4) Train ProtoNet
-python -m src.train_protonet -c "${CFG}"
+if [ "$MULTI" = "1" ]; then
+  echo "[run_all] Identity benchmark: multi-thresholds detected (${CUTOFFS_PCT_STR}%), folds=${FOLDS}."
+else
+  echo "[run_all] Identity benchmark: single threshold detected (${CUTOFFS_PCT_STR}%), folds=${FOLDS}."
+fi
 
-# 5) Evaluate
-python -m src.eval_protonet -c "${CFG}"
-
-# Mark pipeline as completed only if all steps above succeeded
+if [ "$FORCE_EMBED" -eq 1 ]; then FE_FLAG="--force-embed"; else FE_FLAG=""; fi
+python scripts/prepare_identity_splits.py -c "${CFG}" --cutoffs "${CUTOFFS}" --folds "${FOLDS}"
+python scripts/run_identity_benchmark.py -c "${CFG}" --cutoffs "${CUTOFFS}" --folds "${FOLDS}" ${FE_FLAG}
 completed=1

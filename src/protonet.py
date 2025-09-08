@@ -51,10 +51,13 @@ class ProtoNet(nn.Module):
         """
         M = int(y.max().item()) + 1
         D = x.shape[1]
+        # Sum embeddings for each class index
         P = torch.zeros((M, D), device=x.device, dtype=x.dtype)
-        for c in range(M):
-            mask = (y == c)
-            P[c] = x[mask].mean(dim=0)
+        P.index_add_(0, y, x)
+        # Count support examples per class
+        counts = torch.zeros(M, device=x.device, dtype=x.dtype)
+        counts.index_add_(0, y, torch.ones_like(y, dtype=x.dtype))
+        P = P / counts.unsqueeze(1)
         return self.l2n(P)
 
     def forward(

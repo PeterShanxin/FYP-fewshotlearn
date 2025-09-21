@@ -24,6 +24,7 @@ episodes:
 # Embedding runtime knobs
 batch_size_embed: 1
 max_seq_len: 80     # truncate to speed up ESM
+truncate_long_sequences: true
 progress: false
 verbose: true
 dynamic_batch: false

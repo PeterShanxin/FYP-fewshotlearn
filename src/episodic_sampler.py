@@ -118,10 +118,16 @@ class EpisodeSampler:
                     a, cid = parts[0], parts[1]
                     self.acc2cluster[a] = cid
 
-    def _pick_classes(self, M: int) -> List[str]:
-        classes = [c for c in self.split.classes if len(self.class2idx.get(c, [])) > 0]
+    def _pick_classes(self, M: int, min_examples: int = 1) -> List[str]:
+        classes = [
+            c
+            for c in self.split.classes
+            if len(self.class2idx.get(c, [])) >= max(1, min_examples)
+        ]
         if len(classes) < M:
-            raise RuntimeError(f"Not enough classes with embeddings: have {len(classes)}, need {M}")
+            raise RuntimeError(
+                f"Not enough classes with embeddings: have {len(classes)}, need {M} (min_examples={min_examples})"
+            )
         self.rng.shuffle(classes)
         return classes[:M]
 
@@ -142,14 +148,14 @@ class EpisodeSampler:
         """
         if K <= 0 or Q <= 0:
             raise ValueError("K and Q must be positive integers")
-        classes = self._pick_classes(M)
+        need = K + Q
+        classes = self._pick_classes(M, min_examples=need)
         support_x, support_y, query_x, query_y = [], [], [], []
         query_multi: List[List[int]] = []  # used only if multi_label
         for label, ec in enumerate(classes):
             pool_idx = self.class2idx.get(ec, [])
             if len(pool_idx) == 0:
                 raise RuntimeError(f"No embeddings for class {ec}")
-            need = K + Q
             if len(pool_idx) < need:
                 raise RuntimeError(
                     f"Class {ec} has only {len(pool_idx)} samples, but requires at least {need} (K + Q)"

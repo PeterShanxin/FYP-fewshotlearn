@@ -70,6 +70,7 @@ def main() -> None:
     requested_gpus = int(cfg.get("gpus", 1))
     bs = int(cfg.get("batch_size_embed", 4))
     max_seq_len = int(cfg.get("max_seq_len", 1022))  # ESM2 context limit
+    truncate_long = bool(cfg.get("truncate_long_sequences", False))
     use_fp16 = bool(cfg.get("fp16", True)) and torch.cuda.is_available()
     dynamic_batch = bool(cfg.get("dynamic_batch", True))
     show_progress = bool(cfg.get("progress", True))
@@ -84,6 +85,7 @@ def main() -> None:
         "max_seq_len": max_seq_len,
         "joined_tsv": paths["joined_tsv"],
         "embeddings_base": paths["embeddings"],
+        "truncate_long_sequences": truncate_long,
     }
     print(json.dumps(cfg_display, indent=2))
 
@@ -93,23 +95,32 @@ def main() -> None:
 
     pairs: List[Tuple[str, str]] = []
     skipped_long: List[str] = []
+    truncated: List[str] = []
     seq_limit = max_seq_len if max_seq_len > 0 else None
     for acc in accs_needed:
         seq = seq_map.get(acc)
         if seq is None:
             continue
         if seq_limit is not None and len(seq) > seq_limit:
-            skipped_long.append(acc)
-            continue
+            if truncate_long:
+                seq = seq[:seq_limit]
+                truncated.append(acc)
+            else:
+                skipped_long.append(acc)
+                continue
         pairs.append((acc, seq))
     # Sort by sequence length (shortest first) to warm up and reduce early OOM risk
     pairs.sort(key=lambda x: len(x[1]))
     missing = [a for a in accs_needed if a not in seq_map]
     if missing:
         print(f"[embed] WARNING: {len(missing)} accessions missing sequences; they will be skipped.")
+    if truncated:
+        print(
+            f"[embed] INFO: {len(truncated)} sequences exceed max_seq_len={seq_limit} and were truncated."
+        )
     if skipped_long:
         print(
-            f"[embed] WARNING: {len(skipped_long)} sequences exceed max_seq_len={seq_limit} and were skipped instead of truncated."
+            f"[embed] WARNING: {len(skipped_long)} sequences exceed max_seq_len={seq_limit} and were skipped."
         )
 
     # Load ESM model

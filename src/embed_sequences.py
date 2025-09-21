@@ -91,12 +91,26 @@ def main() -> None:
     accs_needed = read_splits(Path(paths["splits_dir"]))
     seq_map = sequence_map(Path(paths["joined_tsv"]))
 
-    pairs = [(a, seq_map[a][:max_seq_len]) for a in accs_needed if a in seq_map]
+    pairs: List[Tuple[str, str]] = []
+    skipped_long: List[str] = []
+    seq_limit = max_seq_len if max_seq_len > 0 else None
+    for acc in accs_needed:
+        seq = seq_map.get(acc)
+        if seq is None:
+            continue
+        if seq_limit is not None and len(seq) > seq_limit:
+            skipped_long.append(acc)
+            continue
+        pairs.append((acc, seq))
     # Sort by sequence length (shortest first) to warm up and reduce early OOM risk
     pairs.sort(key=lambda x: len(x[1]))
     missing = [a for a in accs_needed if a not in seq_map]
     if missing:
         print(f"[embed] WARNING: {len(missing)} accessions missing sequences; they will be skipped.")
+    if skipped_long:
+        print(
+            f"[embed] WARNING: {len(skipped_long)} sequences exceed max_seq_len={seq_limit} and were skipped instead of truncated."
+        )
 
     # Load ESM model
     try:

@@ -56,11 +56,17 @@ python -m src.train_protonet -c config.yaml
 ```
 Saves checkpoint at `results/checkpoints/protonet.pt` and training history at `results/history.json`. Training uses multi‑label targets and hierarchical auxiliary losses by default (see config).
 
-### 5) Evaluate episodically on meta‑test
+### 5) Evaluate episodically on meta-test
 ```bash
 python -m src.eval_protonet -c config.yaml
 ```
-Writes `results/metrics.json` keyed by K. In multi‑label mode: top‑1 hit accuracy (prediction counted correct if top‑1 is among true labels) plus micro/macro precision/recall/F1. In single‑label mode: accuracy and macro‑F1.
+Writes `results/metrics.json` keyed by K. In multi-label mode: top-1 hit accuracy (prediction counted correct if top-1 is among true labels) plus micro/macro precision/recall/F1. In single-label mode: accuracy and macro-F1.
+
+## Multi-EC Detector Cascade (optional)
+- Enable the detector head during training with `detector.enabled: true`. Its BCE loss is weighted by `detector.loss_weight` and the head uses a single hidden layer of size `detector.hidden_dim`.
+- Turn on gating at evaluation time by setting `cascade.enabled: true`. The detector's sigmoid score is compared against `detector.thresh`; when it wins, query logits are thresholded with `tau_multi` to emit multiple ECs (with an argmax fallback if none exceed the threshold). Otherwise the evaluation sticks to the single top-1 label.
+- When either flag is left `false`, the training/eval behaviour matches the previous release exactly. Evaluation prints a short summary with the percent of queries routed to the multi-label branch for quick sanity checks.
+- To tune thresholds on validation data, point the config at your validation split (e.g., lower `episodes.eval` or repoint it to the val JSONL), set `detector.enabled=true` and `cascade.enabled=true`, then re-run `python -m src.eval_protonet` while sweeping `detector.thresh` and `tau_multi`. A short shell/Python loop that edits those two keys between runs works well for quick grids.
 
 ### One‑liners
 
@@ -139,9 +145,10 @@ See `config.yaml` for all knobs. Key defaults:
 - `batch_size_embed=64` (raise on GPU; reduce on CPU)
 - ProtoNet: 256‑dim optional projection, cosine scores scaled by `temperature=10.0`
 - Split rule: classes with `< 40` sequences are sent to meta‑test pool
-- Multi‑EC: `allow_multi_ec=true` (expand multi‑EC rows)
-- Identity‑aware episodes: `identity_disjoint=true` with clusters from `paths.clusters_tsv`
+- Multi-EC: `allow_multi_ec=true` (expand multi-EC rows)
+- Identity-aware episodes: `identity_disjoint=true` with clusters from `paths.clusters_tsv`
 - EC hierarchy: `hierarchy_levels=2`, `hierarchy_weight=0.2`
+- Detector cascade (all off by default): `cascade.enabled=false`, `tau_multi=0.60`, `detector.enabled=false`, `detector.loss_weight=0.10`, `detector.thresh=0.50`, `detector.hidden_dim=32`
 - Random seed: `42`
 
 Paths (relative):

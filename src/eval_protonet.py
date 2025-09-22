@@ -7,7 +7,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List
 
 import numpy as np
 import torch
@@ -39,6 +39,9 @@ def eval_for_K(
     Q: int,
     episodes: int,
     show_progress: bool = True,
+    cascade_cfg: Dict[str, Any] | None = None,
+    detector_cfg: Dict[str, Any] | None = None,
+    tau_multi: float = 0.6,
 ) -> Dict[str, float]:
     ys, yh = [], []  # single-label
     multi_label_mode = False
@@ -47,6 +50,14 @@ def eval_for_K(
     # For multi-label thresholded metrics
     y_true_ml: List[np.ndarray] = []
     y_pred_ml: List[np.ndarray] = []
+    cascade_cfg = cascade_cfg or {}
+    detector_cfg = detector_cfg or {}
+    cascade_enabled = bool(cascade_cfg.get("enabled", False))
+    detector_enabled = bool(detector_cfg.get("enabled", False)) and model.detector_enabled
+    det_thresh = float(detector_cfg.get("thresh", 0.5))
+    tau_multi = float(tau_multi)
+    multi_branch = 0
+    single_branch = 0
     with torch.no_grad():
         for _ in trange(
             episodes,
@@ -56,7 +67,8 @@ def eval_for_K(
         ):
             sx, sy, qx, qy, _classes = sampler.sample_episode(M, K, Q)
             logits, _ = model(sx, sy, qx, None)
-            pred = logits.argmax(dim=-1)
+            sm = torch.softmax(logits, dim=-1)
+            pred = sm.argmax(dim=-1)
             if qy.dim() == 2:
                 multi_label_mode = True
                 idx = pred.view(-1, 1)
@@ -64,13 +76,47 @@ def eval_for_K(
                 hits += int((take > 0.5).sum().item())
                 total += int(qy.shape[0])
                 # Thresholded multi-label predictions for PR/F1
-                probs = torch.sigmoid(logits)
-                y_pred_ml.append((probs >= 0.5).float().cpu().numpy())
+                sg = torch.sigmoid(logits)
+                if cascade_enabled and detector_enabled:
+                    det_logits = model.detect_multi(logits)
+                    if det_logits is None:
+                        raise RuntimeError("Detector enabled in config but missing on model.")
+                    det_scores = torch.sigmoid(det_logits).squeeze(-1)
+                    preds = []
+                    flags = []
+                    for i in range(logits.shape[0]):
+                        if det_scores[i] >= det_thresh:
+                            row = (sg[i] >= tau_multi).float()
+                            if row.sum().item() == 0:
+                                top_idx = pred[i].item()
+                                row = torch.zeros_like(sg[i])
+                                row[top_idx] = 1.0
+                            flags.append(1)
+                        else:
+                            top_idx = pred[i].item()
+                            row = torch.zeros_like(sg[i])
+                            row[top_idx] = 1.0
+                            flags.append(0)
+                        preds.append(row)
+                    stacked = torch.stack(preds, dim=0)
+                    y_pred_ml.append(stacked.cpu().numpy())
+                    sum_flags = int(sum(flags))
+                    multi_branch += sum_flags
+                    single_branch += len(flags) - sum_flags
+                else:
+                    y_pred_ml.append((sg >= 0.5).float().cpu().numpy())
                 y_true_ml.append(qy.float().cpu().numpy())
             else:
                 ys.extend(qy.cpu().numpy().tolist())
                 yh.extend(pred.cpu().numpy().tolist())
     if multi_label_mode:
+        total_branch = multi_branch + single_branch
+        if cascade_enabled and detector_enabled and total_branch > 0:
+            pct_multi = 100.0 * multi_branch / total_branch
+            print(
+                f"[eval][gate] pct_multi={pct_multi:.1f}% ({multi_branch}/{total_branch}) | "
+                f"det_thresh={det_thresh:.2f} tau_multi={tau_multi:.2f}"
+            )
         acc = float(hits / max(total, 1))
         Yt = np.vstack(y_true_ml) if y_true_ml else np.zeros((0, 0), dtype=np.float32)
         Yp = np.vstack(y_pred_ml) if y_pred_ml else np.zeros((0, 0), dtype=np.float32)
@@ -118,7 +164,18 @@ def main() -> None:
         seed=cfg.get("random_seed", 42) + 2, multi_label=multi_label,
         clusters_tsv=clusters_tsv, disjoint_support_query=disjoint,
     )
-    pcfg = ProtoConfig(input_dim=test_sampler.dim, projection_dim=int(cfg.get("projection_dim", 256)), temperature=float(cfg.get("temperature", 10.0)))
+    detector_cfg = cfg.get("detector", {}) or {}
+    cascade_cfg = cfg.get("cascade", {}) or {}
+    tau_multi = float(cfg.get("tau_multi", 0.6))
+    detector_enabled = bool(detector_cfg.get("enabled", False))
+    detector_hidden = int(detector_cfg.get("hidden_dim", 32))
+    pcfg = ProtoConfig(
+        input_dim=test_sampler.dim,
+        projection_dim=int(cfg.get("projection_dim", 256)),
+        temperature=float(cfg.get("temperature", 10.0)),
+        detector_enabled=detector_enabled,
+        detector_hidden=detector_hidden,
+    )
     model = ProtoNet(pcfg).to(device)
     if requested_gpus > 1 and device.type == "cuda":
         print("[eval] Note: evaluation runs on a single GPU; multi-GPU is used for embeddings only.")
@@ -128,7 +185,7 @@ def main() -> None:
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}. Train first.")
     state = torch.load(ckpt_path, map_location=device, weights_only=True)
-    model.load_state_dict(state["model"])  # type: ignore[index]
+    model.load_state_dict(state["model"], strict=False)  # type: ignore[index]
     model.eval()
 
     M = int(cfg["episode"]["M"])
@@ -141,7 +198,18 @@ def main() -> None:
     show_progress = bool(cfg.get("progress", True))
     for K in cfg["episode"]["K_eval"]:
         print(f"[eval] M={M} K={K} Q={Q} episodes={n_eval}")
-        metrics = eval_for_K(model, test_sampler, M, int(K), Q, n_eval, show_progress=show_progress)
+        metrics = eval_for_K(
+            model,
+            test_sampler,
+            M,
+            int(K),
+            Q,
+            n_eval,
+            show_progress=show_progress,
+            cascade_cfg=cascade_cfg,
+            detector_cfg=detector_cfg,
+            tau_multi=tau_multi,
+        )
         results[f"K={K}"] = metrics
         print(f"[eval] {metrics}")
 

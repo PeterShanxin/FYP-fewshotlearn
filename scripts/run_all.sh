@@ -198,6 +198,118 @@ else
 fi
 
 if [ "$FORCE_EMBED" -eq 1 ]; then FE_FLAG="--force-embed"; else FE_FLAG=""; fi
-python scripts/prepare_identity_splits.py -c "${CFG}" --cutoffs "${CUTOFFS}" --folds "${FOLDS}"
-python scripts/run_identity_benchmark.py -c "${CFG}" --cutoffs "${CUTOFFS}" --folds "${FOLDS}" ${FE_FLAG}
+SKIP_PREPARE_FLAG=""
+read -r HAVE_CACHED_SPLITS <<EOF
+$(python - "${CFG}" "${CUTOFFS}" "${FOLDS}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+import yaml
+
+
+def parse_cutoffs(raw: str) -> list[float]:
+    values: list[float] = []
+    for chunk in raw.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        try:
+            val = float(chunk)
+        except ValueError:
+            continue
+        if val > 1.0:
+            val = val / 100.0
+        values.append(val)
+    return values
+
+
+def path_exists(path: Path) -> bool:
+    try:
+        return path.exists()
+    except OSError:
+        return False
+
+
+cfg_path, cutoffs_raw, folds_raw = sys.argv[1:4]
+try:
+    folds = int(folds_raw)
+except Exception:
+    print("0")
+    sys.exit(0)
+
+cutoffs = parse_cutoffs(cutoffs_raw)
+if not cutoffs:
+    print("0")
+    sys.exit(0)
+
+with open(cfg_path, "r", encoding="utf-8") as f:
+    cfg = yaml.safe_load(f) or {}
+
+paths = cfg.get("paths", {}) or {}
+outputs = Path(paths.get("outputs", "results")).resolve()
+identity_def = str(cfg.get("identity_definition", "tool_default"))
+stratify_by = str(cfg.get("stratify_by", "EC_top"))
+seed = int(cfg.get("random_seed", 42))
+
+ok = True
+for cutoff in cutoffs:
+    pct = int(round(cutoff * 100))
+    split_dir = outputs / f"split-{pct}"
+    config_used = split_dir / "config.used.yaml"
+    folds_json = split_dir / "folds.json"
+    if not (path_exists(config_used) and path_exists(folds_json)):
+        ok = False
+        break
+    try:
+        used_cfg = yaml.safe_load(config_used.read_text(encoding="utf-8")) or {}
+    except Exception:
+        ok = False
+        break
+    if int(used_cfg.get("id_threshold", -1)) != pct:
+        ok = False
+        break
+    if int(used_cfg.get("folds", folds)) != folds:
+        ok = False
+        break
+    if str(used_cfg.get("identity_definition", identity_def)) != identity_def:
+        ok = False
+        break
+    if str(used_cfg.get("stratify_by", stratify_by)) != stratify_by:
+        ok = False
+        break
+    if int(used_cfg.get("random_seed", seed)) != seed:
+        ok = False
+        break
+    try:
+        folds_info = json.loads(folds_json.read_text(encoding="utf-8"))
+    except Exception:
+        ok = False
+        break
+    folds_map = folds_info.get("folds", {}) or {}
+    if len(folds_map) != folds:
+        ok = False
+        break
+    for idx in range(1, folds + 1):
+        fold_dir = split_dir / f"fold-{idx}"
+        if not (path_exists(fold_dir / "train.jsonl") and path_exists(fold_dir / "val.jsonl") and path_exists(fold_dir / "test.jsonl")):
+            ok = False
+            break
+    if not ok:
+        break
+
+print("1" if ok else "0")
+PY
+)
+EOF
+
+if [ "$HAVE_CACHED_SPLITS" = "1" ]; then
+  echo "[run_all] Reusing cached identity splits for thresholds ${CUTOFFS_PCT_STR}% (folds=${FOLDS})."
+  SKIP_PREPARE_FLAG="--skip_prepare"
+else
+  echo "[run_all] Preparing identity splits for thresholds ${CUTOFFS_PCT_STR}% (folds=${FOLDS})."
+  python scripts/prepare_identity_splits.py -c "${CFG}" --cutoffs "${CUTOFFS}" --folds "${FOLDS}"
+fi
+
+python scripts/run_identity_benchmark.py -c "${CFG}" --cutoffs "${CUTOFFS}" --folds "${FOLDS}" ${FE_FLAG} ${SKIP_PREPARE_FLAG}
 completed=1

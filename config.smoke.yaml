@@ -44,6 +44,17 @@ hierarchy_weight: 0.2
 identity_disjoint: true
 allow_multi_ec: true
 
+cascade:
+  enabled: false
+
+tau_multi: 0.60
+
+detector:
+  enabled: false
+  loss_weight: 0.10
+  thresh: 0.50
+  hidden_dim: 32
+
 # Clustering defaults (auto)
 cluster_identity: 0.5
 cluster_coverage: 0.5

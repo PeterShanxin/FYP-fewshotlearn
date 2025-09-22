@@ -10,13 +10,14 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import sys
 from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
 import pandas as pd
 import torch
 import yaml
-from tqdm import tqdm
+from tqdm.auto import tqdm
 import torch.nn as nn
 
 
@@ -245,7 +246,16 @@ def main() -> None:
     with torch.no_grad():
         i = 0
         total = len(pairs)
-        pbar = tqdm(total=total, disable=not show_progress, desc="[embed]", dynamic_ncols=True)
+        tqdm_kwargs = {}
+        if show_progress:
+            tqdm_kwargs["file"] = sys.stdout
+        pbar = tqdm(
+            total=total,
+            disable=not show_progress,
+            desc="[embed]",
+            dynamic_ncols=True,
+            **tqdm_kwargs,
+        )
         while i < total:
             batch_list = pairs[i:i+bs]
             try:
@@ -253,7 +263,7 @@ def main() -> None:
                 i += len(batch_list)
                 if show_progress:
                     pbar.update(len(batch_list))
-                    pbar.set_postfix(bs=bs, refresh=False)
+                    pbar.set_postfix(bs=bs, refresh=True)
             except torch.cuda.OutOfMemoryError:
                 torch.cuda.empty_cache()
                 if not dynamic_batch:

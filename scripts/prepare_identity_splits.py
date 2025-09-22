@@ -49,7 +49,60 @@ def run_quiet(cmd: List[str], cwd: Path | None = None, log_file: Path | None = N
         subprocess.run(cmd, check=True, cwd=str(cwd) if cwd else None, stdout=stdout, stderr=stderr)
 
 
-def mmseqs_pairwise_edges(fasta: Path, workdir: Path, min_id: float, min_cov: float) -> List[Tuple[str, str]]:
+def detect_allocated_cpus(config_threads: int | None = None) -> int:
+    """Best-effort detection of CPUs allocated to this process.
+
+    Priority:
+    1) explicit override (config_threads)
+    2) Linux CPU affinity (cgroups/SLURM cpuset)
+    3) common scheduler/env hints
+    4) os.cpu_count()
+    """
+    # 1) explicit override
+    if config_threads is not None:
+        try:
+            v = int(config_threads)
+            if v > 0:
+                return v
+        except Exception:
+            pass
+    # 2) scheduler/env hints (prefer explicit allocations over affinity if present)
+    env_keys = [
+        "SLURM_CPUS_PER_TASK",  # SLURM per-task allocation
+        "NSLOTS",               # SGE/UGE
+        "PBS_NP",               # PBS/Torque
+        "NCPUS",                # generic
+        "OMP_NUM_THREADS",      # OpenMP hint
+    ]
+    for k in env_keys:
+        v = os.environ.get(k)
+        if v is None:
+            continue
+        try:
+            parsed = int(str(v).strip())
+            if parsed > 0:
+                hw = os.cpu_count() or parsed
+                return max(1, min(parsed, hw))
+        except Exception:
+            continue
+    # 3) CPU affinity
+    try:
+        n = len(os.sched_getaffinity(0))  # type: ignore[attr-defined]
+        if n > 0:
+            return n
+    except Exception:
+        pass
+    # 4) fallback to logical CPUs
+    return max(1, int(os.cpu_count() or 1))
+
+
+def mmseqs_pairwise_edges(
+    fasta: Path,
+    workdir: Path,
+    min_id: float,
+    min_cov: float,
+    threads: int | None = None,
+) -> List[Tuple[str, str]]:
     """Use MMseqs2 easy-search to enumerate pairs with identity ≥ min_id and coverage ≥ min_cov.
 
     Returns undirected edges (a,b) with a < b to de-duplicate.
@@ -57,14 +110,15 @@ def mmseqs_pairwise_edges(fasta: Path, workdir: Path, min_id: float, min_cov: fl
     workdir.mkdir(parents=True, exist_ok=True)
     aln = workdir / "pairs.tsv"
     tmp = workdir / "tmp"
-    threads = str(max(1, (os.cpu_count() or 1)))
+    threads = detect_allocated_cpus(threads)
+    threads_str = str(threads)
     # Use paths relative to workdir because we set cwd=workdir.
     log_path = workdir / "logs" / "mmseqs_easy_search.log"
     # Quiet external tool output; tee to log file for debugging
     run_quiet([
         "mmseqs", "easy-search", str(fasta.name), str(fasta.name), str(aln.name), str(tmp.name),
         "--min-seq-id", str(min_id),
-        "-c", str(min_cov), "--cov-mode", "1", "--threads", threads,
+        "-c", str(min_cov), "--cov-mode", "1", "--threads", threads_str,
     ], cwd=workdir, log_file=log_path)
     edges: Set[Tuple[str, str]] = set()
     with open(aln, "r", encoding="utf-8") as f:
@@ -271,8 +325,16 @@ def main() -> None:
         mmseqs_ok = shutil.which("mmseqs") is not None and identity_definition in ("tool_default",)
         edges: List[Tuple[str, str]]
         if mmseqs_ok:
-            print(f"[id-split][mmseqs] easy-search min_id={cut} cov>={float(cfg.get('cluster_coverage', 0.5))} (quiet; logs at {work/'logs/mmseqs_easy_search.log'})")
-            edges = mmseqs_pairwise_edges(fasta, work, min_id=cut, min_cov=float(cfg.get("cluster_coverage", 0.5)))
+            cov = float(cfg.get('cluster_coverage', 0.5))
+            # Optional override via config: mmseqs_threads
+            cfg_thr = cfg.get("mmseqs_threads")
+            try:
+                cfg_thr_i = int(cfg_thr) if cfg_thr is not None else None
+            except Exception:
+                cfg_thr_i = None
+            thr_used = detect_allocated_cpus(cfg_thr_i)
+            print(f"[id-split][mmseqs] easy-search min_id={cut} cov>={cov} threads={thr_used} (quiet; logs at {work/'logs/mmseqs_easy_search.log'})")
+            edges = mmseqs_pairwise_edges(fasta, work, min_id=cut, min_cov=cov, threads=thr_used)
             clustering_method = "mmseqs_easy_search"
             identity_def_used = "tool_default"
         else:
@@ -357,6 +419,11 @@ def main() -> None:
                 fold_label[best_fi][k] += v
 
         folds_json = split_dir / "folds.json"
+        notes: List[str] = []
+        if F == 1:
+            notes.append(
+                "folds=1 detected: train/val use all clusters; test reuses the same clusters (no hold-out)."
+            )
         folds_payload = {
             "folds": {str(i+1): folds[i] for i in range(F)},
             "fold_sizes": fold_size,
@@ -367,7 +434,7 @@ def main() -> None:
             "clustering_method": clustering_method,
             "random_seed": seed,
             "stratify_by": stratify_by,
-            "notes": [],
+            "notes": notes,
         }
         with open(folds_json, "w", encoding="utf-8") as f:
             json.dump(folds_payload, f, indent=2)
@@ -375,7 +442,10 @@ def main() -> None:
         # Emit per-fold splits
         for fi in range(F):
             test_clusters = set(folds[fi])
-            trainval_clusters = set(cluster_ids) - test_clusters
+            if F == 1:
+                trainval_clusters = set(cluster_ids)
+            else:
+                trainval_clusters = set(cluster_ids) - test_clusters
             # Build per-ec accessions restricted to cluster sets
             def filter_by_clusters(by_ec: Dict[str, List[str]], keep: set[str]) -> Dict[str, List[str]]:
                 keep_acc = {a for c in keep for a in clu2acc[c]}

@@ -50,6 +50,8 @@ def eval_for_K(
     # For multi-label thresholded metrics
     y_true_ml: List[np.ndarray] = []
     y_pred_ml: List[np.ndarray] = []
+    # Track detector routing decisions when cascade is enabled
+    route_flags_all: List[int] = []  # 1 if routed to multi-branch, else 0
     cascade_cfg = cascade_cfg or {}
     detector_cfg = detector_cfg or {}
     cascade_enabled = bool(cascade_cfg.get("enabled", False))
@@ -103,6 +105,7 @@ def eval_for_K(
                     sum_flags = int(sum(flags))
                     multi_branch += sum_flags
                     single_branch += len(flags) - sum_flags
+                    route_flags_all.extend(flags)
                 else:
                     y_pred_ml.append((sg >= 0.5).float().cpu().numpy())
                 y_true_ml.append(qy.float().cpu().numpy())
@@ -128,7 +131,8 @@ def eval_for_K(
         macro_p = precision_score(Yt, Yp, average="macro", zero_division=0)
         macro_r = recall_score(Yt, Yp, average="macro", zero_division=0)
         macro_f1 = f1_score(Yt, Yp, average="macro", zero_division=0)
-        return {
+        # Set-based metrics and multi-EC detection quality
+        metrics: Dict[str, float] = {
             "acc_top1_hit": acc,
             "micro_precision": float(micro_p),
             "micro_recall": float(micro_r),
@@ -137,6 +141,66 @@ def eval_for_K(
             "macro_recall": float(macro_r),
             "macro_f1": float(macro_f1),
         }
+        if Yt.size > 0:
+            # Cardinalities
+            card_true = Yt.sum(axis=1)
+            card_pred = Yp.sum(axis=1)
+            true_is_multi = card_true > 1.0
+            # If routing flags exist (cascade enabled), use them to define predicted-multi; else infer from card_pred
+            if cascade_enabled and detector_enabled and len(route_flags_all) == Yt.shape[0]:
+                pred_is_multi = np.array(route_flags_all, dtype=bool)
+            else:
+                pred_is_multi = card_pred > 1.0
+            # Multi-EC detection metrics
+            tp = float(np.logical_and(true_is_multi, pred_is_multi).sum())
+            fp = float(np.logical_and(~true_is_multi, pred_is_multi).sum())
+            fn = float(np.logical_and(true_is_multi, ~pred_is_multi).sum())
+            det_prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            det_rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            det_f1 = 2 * det_prec * det_rec / (det_prec + det_rec) if (det_prec + det_rec) > 0 else 0.0
+            metrics.update(
+                {
+                    "det_true_multi_rate": float(true_is_multi.mean()),
+                    "det_pred_multi_rate": float(np.mean(pred_is_multi.astype(float))),
+                    "det_precision": float(det_prec),
+                    "det_recall": float(det_rec),
+                    "det_f1": float(det_f1),
+                }
+            )
+            # Subset accuracy (exact set) and Jaccard
+            inter = np.logical_and(Yt > 0.5, Yp > 0.5).sum(axis=1).astype(float)
+            union = np.logical_or(Yt > 0.5, Yp > 0.5).sum(axis=1).astype(float)
+            jacc = np.divide(inter, np.maximum(union, 1.0))
+            subset_acc = (union == inter) & (union > 0)
+            metrics.update(
+                {
+                    "subset_acc_overall": float(subset_acc.mean() if subset_acc.size > 0 else 0.0),
+                    "jaccard_overall": float(jacc.mean() if jacc.size > 0 else 0.0),
+                }
+            )
+            # Multi-only variants
+            if true_is_multi.any():
+                mask = true_is_multi
+                metrics.update(
+                    {
+                        "subset_acc_multi": float(subset_acc[mask].mean()),
+                        "jaccard_multi": float(jacc[mask].mean()),
+                        "card_mae_multi": float(np.abs(card_pred[mask] - card_true[mask]).mean()),
+                        "mean_true_card_multi": float(card_true[mask].mean()),
+                        "mean_pred_card_multi": float(card_pred[mask].mean()),
+                        "underpred_ratio_multi": float(((card_pred[mask] < card_true[mask]).astype(float)).mean()),
+                        "overpred_ratio_multi": float(((card_pred[mask] > card_true[mask]).astype(float)).mean()),
+                    }
+                )
+            # Overall cardinality error
+            metrics.update(
+                {
+                    "card_mae_overall": float(np.abs(card_pred - card_true).mean()),
+                    "mean_true_card_overall": float(card_true.mean()),
+                    "mean_pred_card_overall": float(card_pred.mean()),
+                }
+            )
+        return metrics
     # Single-label metrics
     acc = accuracy_score(ys, yh)
     p = precision_score(ys, yh, average="macro", zero_division=0)

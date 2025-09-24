@@ -58,12 +58,12 @@ hierarchy_weight: 0.2         # total weight for auxiliary hierarchical losses
 cascade:
   enabled: true              # if true, enable detector gating during evaluation
 
-tau_multi: 0.60               # sigmoid threshold for multi-label emission when gated
+tau_multi: 0.40               # sigmoid threshold for multi-label emission when gated
 
 detector:
   enabled: true              # if true, train the multi-EC detector and gate predictions
   loss_weight: 0.10           # BCE loss weight for detector head (added to main loss)
-  thresh: 0.50                # sigmoid threshold on detector output to trigger multi-branch
+  thresh: 0.20                # sigmoid threshold on detector output to trigger multi-branch
   hidden_dim: 32              # detector MLP hidden size
 
 # Identity-aware sampling (requires clusters_tsv)

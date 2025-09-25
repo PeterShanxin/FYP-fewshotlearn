@@ -253,6 +253,15 @@ class GlobalSupportEvaluator:
 
         probs = torch.sigmoid(logits)
 
+        # Top-1 hit accuracy (argmax against multi-hot ground truth),
+        # analogous to episodic "acc_top1_hit" for comparability.
+        if y_true.size > 0:
+            top1_idx = probs.argmax(dim=1).cpu().numpy()
+            top1_hits = (y_true[np.arange(y_true.shape[0]), top1_idx] > 0.5).astype(np.float32)
+            acc_top1 = float(top1_hits.mean())
+        else:
+            acc_top1 = 0.0
+
         if shortlist > 0 and shortlist < self.num_classes:
             topk = torch.topk(probs, k=shortlist, dim=1)
             mask = torch.zeros_like(probs, dtype=torch.bool)
@@ -272,6 +281,7 @@ class GlobalSupportEvaluator:
 
         metrics = _metrics_for_bucket(y_true, y_pred)
         overall = {
+            "acc_top1_hit": float(acc_top1),
             "micro_precision": metrics["micro_precision"],
             "micro_recall": metrics["micro_recall"],
             "micro_f1": metrics["micro_f1"],
@@ -331,6 +341,7 @@ def run_global_evaluation(
     tau = float(tau_multi if tau_multi is not None else base_tau)
     temp = float(temperature if temperature is not None else base_temp)
     shortlist = int(shortlist_topN if shortlist_topN is not None else base_shortlist)
+    ensure_top1 = bool(eval_cfg.get("ensure_top1", True))
 
     thresholds = _load_thresholds(thresholds_path)
     if calibration_path is not None and calibration_path.exists():
@@ -348,6 +359,7 @@ def run_global_evaluation(
         device=device,
         shortlist_topN=shortlist,
         per_ec_thresholds=thresholds,
+        ensure_top1=ensure_top1,
     )
     return evaluator.evaluate(
         temperature=temp,

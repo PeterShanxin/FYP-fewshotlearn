@@ -295,6 +295,7 @@ def main() -> None:
 
     g_ths, g_micro, g_micro_ci, has_micro = extract_global_metric(summary, "micro_f1")
     _, g_macro, g_macro_ci, has_macro = extract_global_metric(summary, "macro_f1")
+    _, g_top1, g_top1_ci, has_top1 = extract_global_metric(summary, "acc_top1_hit")
     if has_micro or has_macro:
         fig, ax = plt.subplots(figsize=(7, 4))
         plotted = False
@@ -310,6 +311,21 @@ def main() -> None:
             ax.legend()
         fig.tight_layout()
         fig.savefig(out_dir / "global_f1_vs_threshold.png", dpi=args.dpi)
+        figs.append(fig)
+
+    # Separate plot for Global Top-1 hit rate vs threshold
+    if has_top1:
+        fig, ax = plt.subplots(figsize=(7, 4))
+        plotted = bool(plot_line_with_ci(ax, g_ths, g_top1, g_top1_ci, label="Global Top-1", color="#72B7B2"))
+        ax.set_title("Global Top-1 Hit vs. Identity Threshold")
+        ax.set_xlabel("Identity threshold (%)")
+        ax.set_ylabel("Top-1 hit (mean ± 95% CI)")
+        ax.set_ylim(0.0, 1.0)
+        ax.grid(True, alpha=0.3)
+        if plotted:
+            ax.legend()
+        fig.tight_layout()
+        fig.savefig(out_dir / "global_top1_vs_threshold.png", dpi=args.dpi)
         figs.append(fig)
 
     # 3) Precision/Recall vs threshold (macro)
@@ -413,8 +429,9 @@ def main() -> None:
     s_clu = f"- #Clusters {cluster_trend} with threshold: " + " → ".join(str(c) for c in cluster_counts)
     s_gmicro = describe_global("Global micro-F1", g_micro)
     s_gmacro = describe_global("Global macro-F1", g_macro)
+    s_gtop1 = describe_global("Global top-1", g_top1)
     s_cov = describe_global("Global coverage", coverage_means, fmt="{:.1%}")
-    for line in (s_acc, s_mf1, s_mp, s_mr, s_gmicro, s_gmacro, s_cov, s_clu):
+    for line in (s_acc, s_mf1, s_mp, s_mr, s_gmicro, s_gmacro, s_gtop1, s_cov, s_clu):
         print(line)
     print(f"[visualize] Wrote figures to: {out_dir.resolve()}")
 
@@ -435,6 +452,7 @@ def main() -> None:
         text_lines.append("")
         text_lines.append(s_gmicro)
         text_lines.append(s_gmacro)
+        text_lines.append(s_gtop1)
         text_lines.append(s_cov)
         text_lines.append(s_clu)
         body = "\n".join(text_lines)

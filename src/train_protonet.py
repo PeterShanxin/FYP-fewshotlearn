@@ -7,9 +7,10 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 from contextlib import contextmanager
 
 import numpy as np
@@ -36,6 +37,31 @@ def pick_device(cfg: dict) -> torch.device:
 def ensure_dirs(paths: Dict[str, str]) -> None:
     Path(paths["outputs"]).mkdir(parents=True, exist_ok=True)
     Path(paths["embeddings"]).parent.mkdir(parents=True, exist_ok=True)
+
+
+def load_sequence_lookup(joined_tsv: Path) -> Dict[str, str]:
+    """Streaming TSV reader that builds accession → sequence map."""
+    lookup: Dict[str, str] = {}
+    if not joined_tsv.exists():
+        raise FileNotFoundError(f"Joined TSV not found for sequence lookup: {joined_tsv}")
+    with open(joined_tsv, "r", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        if reader.fieldnames is None:
+            raise ValueError(f"Joined TSV lacks header: {joined_tsv}")
+        lower_map = {name.lower(): name for name in reader.fieldnames}
+        acc_key = lower_map.get("accession")
+        seq_key = lower_map.get("sequence")
+        if acc_key is None or seq_key is None:
+            raise KeyError(
+                f"Joined TSV must contain 'accession' and 'sequence' columns (found: {reader.fieldnames})"
+            )
+        for row in reader:
+            acc = row.get(acc_key)
+            seq = row.get(seq_key)
+            if not acc or not seq:
+                continue
+            lookup[str(acc)] = str(seq).upper()
+    return lookup
 
 
 @contextmanager
@@ -156,19 +182,75 @@ def main() -> None:
     # Options
     multi_label = bool(cfg.get("multi_label", False))
     clusters_tsv = Path(paths.get("clusters_tsv", "")) if paths.get("clusters_tsv") else None
-    disjoint = bool(cfg.get("identity_disjoint", False))
+    sampler_cfg = cfg.get("sampler", {}) or {}
+    disjoint = bool(sampler_cfg.get("identity_disjoint", cfg.get("identity_disjoint", False)))
+    with_replacement_fallback = bool(sampler_cfg.get("with_replacement_fallback", False))
+    fallback_scope = sampler_cfg.get("fallback_scope", "train_only")
+    rare_class_boost = sampler_cfg.get("rare_class_boost", "none")
+
+    seq_lookup: Optional[Dict[str, str]] = None
+    if with_replacement_fallback:
+        seq_lookup = load_sequence_lookup(Path(paths["joined_tsv"]))
+
+    runs_root = Path(paths.get("runs", Path(paths["outputs"]).parent / "runs"))
+    exp_id = str(cfg.get("exp_id") or cfg.get("run_id") or Path(paths["outputs"]).name)
+    usage_dir = runs_root / exp_id
 
     # Samplers
     train_sampler = EpisodeSampler(
-        Path(paths["embeddings"]), Path(paths["splits_dir"]) / "train.jsonl", device,
-        seed=cfg.get("random_seed", 42), multi_label=multi_label,
-        clusters_tsv=clusters_tsv, disjoint_support_query=disjoint,
+        Path(paths["embeddings"]),
+        Path(paths["splits_dir"]) / "train.jsonl",
+        device,
+        seed=cfg.get("random_seed", 42),
+        phase="train",
+        multi_label=multi_label,
+        clusters_tsv=clusters_tsv,
+        disjoint_support_query=disjoint,
+        with_replacement_fallback=with_replacement_fallback,
+        fallback_scope=fallback_scope,
+        rare_class_boost=rare_class_boost,
+        sequence_lookup=seq_lookup,
+        usage_log_dir=usage_dir,
     )
-    val_sampler   = EpisodeSampler(
-        Path(paths["embeddings"]), Path(paths["splits_dir"]) / "val.jsonl", device,
-        seed=cfg.get("random_seed", 42) + 1, multi_label=multi_label,
-        clusters_tsv=clusters_tsv, disjoint_support_query=disjoint,
+    val_sampler = EpisodeSampler(
+        Path(paths["embeddings"]),
+        Path(paths["splits_dir"]) / "val.jsonl",
+        device,
+        seed=cfg.get("random_seed", 42) + 1,
+        phase="val",
+        multi_label=multi_label,
+        clusters_tsv=clusters_tsv,
+        disjoint_support_query=disjoint,
+        with_replacement_fallback=with_replacement_fallback,
+        fallback_scope=fallback_scope,
+        rare_class_boost="none",
+        sequence_lookup=seq_lookup if fallback_scope == "all" else None,
     )
+    episode_cfg = cfg.get("episode", {}) or {}
+
+    def _resolve_episode_value(primary: str, fallbacks: list[str], default: int) -> int:
+        keys = [primary] + fallbacks
+        for key in keys:
+            if key not in episode_cfg:
+                continue
+            val = episode_cfg[key]
+            if isinstance(val, list):
+                if not val:
+                    continue
+                return int(val[0])
+            try:
+                return int(val)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                continue
+        return int(default)
+
+    M_train = _resolve_episode_value("M_train", ["M"], 10)
+    K_train = _resolve_episode_value("K_train", ["K"], 1)
+    Q_train = _resolve_episode_value("Q_train", ["Q"], 5)
+    M_val = _resolve_episode_value("M_val", ["M"], M_train)
+    K_val = _resolve_episode_value("K_val", ["K_eval", "K"], K_train)
+    Q_val = _resolve_episode_value("Q_val", ["Q_eval", "Q"], Q_train)
+
     # Detect empty val split to optionally skip validation
     has_val = False
     try:
@@ -199,9 +281,6 @@ def main() -> None:
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     det_loss_fn = torch.nn.BCEWithLogitsLoss() if detector_enabled else None
 
-    M = int(cfg["episode"]["M"])
-    K = int(cfg["episode"]["K_train"])
-    Q = int(cfg["episode"]["Q"])
     n_train = int(cfg["episodes"]["train"])
     n_val_eval = max(1, int(cfg["episodes"]["val"]))
     # Validation cadence and size knobs
@@ -213,7 +292,15 @@ def main() -> None:
 
     print("[train] config:")
     print(json.dumps({
-        "device": str(device), "gpus_requested": requested_gpus, "M": M, "K_train": K, "Q": Q, "episodes_train": n_train,
+        "device": str(device),
+        "gpus_requested": requested_gpus,
+        "M_train": M_train,
+        "K_train": K_train,
+        "Q_train": Q_train,
+        "M_val": M_val,
+        "K_val": K_val,
+        "Q_val": Q_val,
+        "episodes_train": n_train,
         "projection_dim": int(cfg.get("projection_dim", 256)),
         "temperature": float(cfg.get("temperature", 10.0)),
         "fp16_train": use_amp,
@@ -221,6 +308,8 @@ def main() -> None:
         "episodes_per_val_check": episodes_per_val_check,
         "multi_label": multi_label,
         "identity_disjoint": disjoint,
+        "rare_class_boost": rare_class_boost,
+        "fallback_scope": fallback_scope,
         "has_val": has_val,
         "detector_enabled": detector_enabled,
         "detector_loss_weight": detector_loss_weight,
@@ -239,7 +328,7 @@ def main() -> None:
         range(n_train), desc="episodes", dynamic_ncols=True, leave=True, disable=not show_progress
     )
     for ep in pbar:
-        sx, sy, qx, qy, classes = train_sampler.sample_episode(M, K, Q)
+        sx, sy, qx, qy, classes = train_sampler.sample_episode(M_train, K_train, Q_train)
         if use_amp:
             with torch.cuda.amp.autocast(dtype=torch.float16):
                 logits, loss = model(sx, sy, qx, qy)
@@ -283,7 +372,14 @@ def main() -> None:
 
         if has_val and ((ep + 1) % eval_every == 0 or ep == n_train - 1):
             acc = episodic_accuracy(
-                model, val_sampler, M, K, Q, episodes=min(episodes_per_val_check, n_val_eval), show_progress=show_progress, multi_label=multi_label
+                model,
+                val_sampler,
+                M_val,
+                K_val,
+                Q_val,
+                episodes=min(episodes_per_val_check, n_val_eval),
+                show_progress=show_progress,
+                multi_label=multi_label,
             )
             history["val_acc"].append(acc)
             history["checkpoints_after_episode"].append(ep + 1)
@@ -321,6 +417,11 @@ def main() -> None:
     hist_path = Path(paths["outputs"]) / "history.json"
     with open(hist_path, "w") as f:
         json.dump(dict(history=history, best_val_acc=float(best_acc)), f, indent=2)
+
+    try:
+        train_sampler.write_usage_csv(usage_dir)
+    except Exception as exc:  # pragma: no cover - diagnostics only
+        print(f"[train] WARNING: failed to write sampler stats ({exc})")
 
     print(f"[train] best_val_acc={best_acc:.4f} | checkpoint → {ckpt_path}")
 

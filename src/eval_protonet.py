@@ -7,7 +7,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -16,6 +16,7 @@ from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_sc
 from tqdm.auto import trange
 
 from .episodic_sampler import EpisodeSampler
+from .eval_global import run_global_evaluation
 from .protonet import ProtoConfig, ProtoNet
 
 
@@ -212,6 +213,7 @@ def eval_for_K(
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("-c", "--config", default="config.yaml")
+    ap.add_argument("--mode", choices=["episodic", "global_support"], default=None)
     args = ap.parse_args()
 
     cfg = load_cfg(args.config)
@@ -219,14 +221,53 @@ def main() -> None:
     device = pick_device(cfg)
     requested_gpus = int(cfg.get("gpus", 1))
 
-    # Sampler and model init
+    eval_cfg = cfg.get("eval", {}) or {}
+    mode = args.mode or str(eval_cfg.get("mode", "episodic"))
+
+    if mode == "global_support":
+        prototypes_path = Path(eval_cfg.get("prototypes_path", "artifacts/prototypes.npz"))
+        thresholds_path_raw = eval_cfg.get("per_ec_thresholds_path")
+        thresholds_path = Path(thresholds_path_raw) if thresholds_path_raw else None
+        calibration_path_raw = eval_cfg.get("calibration_path", "artifacts/calibration.json")
+        calibration_path = Path(calibration_path_raw) if calibration_path_raw else None
+        metrics = run_global_evaluation(
+            config_path=Path(args.config),
+            prototypes_path=prototypes_path,
+            split=eval_cfg.get("split", "test"),
+            tau_multi=None,
+            temperature=None,
+            shortlist_topN=None,
+            thresholds_path=thresholds_path,
+            calibration_path=calibration_path,
+        )
+        out_path = Path(paths["outputs"]) / "global_metrics.json"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w", encoding="utf-8") as handle:
+            json.dump(metrics, handle, indent=2)
+        print(json.dumps(metrics, indent=2))
+        print(f"[eval][global] wrote metrics → {out_path}")
+        return
+
+    # Episodic evaluation path
+    sampler_cfg = cfg.get("sampler", {}) or {}
     multi_label = bool(cfg.get("multi_label", False))
     clusters_tsv = Path(paths.get("clusters_tsv", "")) if paths.get("clusters_tsv") else None
-    disjoint = bool(cfg.get("identity_disjoint", False))
+    disjoint = bool(sampler_cfg.get("identity_disjoint", cfg.get("identity_disjoint", False)))
+    with_replacement_fallback = bool(sampler_cfg.get("with_replacement_fallback", False))
+    fallback_scope = sampler_cfg.get("fallback_scope", "train_only")
+
     test_sampler = EpisodeSampler(
-        Path(paths["embeddings"]), Path(paths["splits_dir"]) / "test.jsonl", device,
-        seed=cfg.get("random_seed", 42) + 2, multi_label=multi_label,
-        clusters_tsv=clusters_tsv, disjoint_support_query=disjoint,
+        Path(paths["embeddings"]),
+        Path(paths["splits_dir"]) / "test.jsonl",
+        device,
+        seed=cfg.get("random_seed", 42) + 2,
+        phase="test",
+        multi_label=multi_label,
+        clusters_tsv=clusters_tsv,
+        disjoint_support_query=disjoint,
+        with_replacement_fallback=with_replacement_fallback,
+        fallback_scope=fallback_scope,
+        rare_class_boost="none",
     )
     detector_cfg = cfg.get("detector", {}) or {}
     cascade_cfg = cfg.get("cascade", {}) or {}
@@ -244,7 +285,6 @@ def main() -> None:
     if requested_gpus > 1 and device.type == "cuda":
         print("[eval] Note: evaluation runs on a single GPU; multi-GPU is used for embeddings only.")
 
-    # Load checkpoint
     ckpt_path = Path(paths["outputs"]) / "checkpoints" / "protonet.pt"
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}. Train first.")
@@ -252,15 +292,39 @@ def main() -> None:
     model.load_state_dict(state["model"], strict=False)  # type: ignore[index]
     model.eval()
 
-    M = int(cfg["episode"]["M"])
-    Q = int(cfg["episode"]["Q"])
+    episode_cfg = cfg.get("episode", {}) or {}
+
+    def _resolve_episode_value(primary: str, fallbacks: List[str], default: int) -> int:
+        keys = [primary] + fallbacks
+        for key in keys:
+            if key not in episode_cfg:
+                continue
+            val = episode_cfg[key]
+            if isinstance(val, list):
+                if not val:
+                    continue
+                return int(val[0])
+            try:
+                return int(val)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                continue
+        return int(default)
+
+    M = _resolve_episode_value("M_val", ["M"], 10)
+    Q = _resolve_episode_value("Q_val", ["Q"], 10)
+    K_default = _resolve_episode_value("K_val", ["K"], 1)
+    K_eval_cfg = episode_cfg.get("K_eval")
+    if isinstance(K_eval_cfg, list) and K_eval_cfg:
+        K_values = [int(k) for k in K_eval_cfg]
+    else:
+        K_values = [K_default]
     # Allow separate eval episodes; fallback to 'val' if unspecified
     episodes_cfg = cfg.get("episodes", {})
     n_eval = int(episodes_cfg.get("eval", max(100, int(episodes_cfg.get("val", 200)))))
 
     results: Dict[str, Dict[str, float]] = {}
     show_progress = bool(cfg.get("progress", True))
-    for K in cfg["episode"]["K_eval"]:
+    for K in K_values:
         print(f"[eval] M={M} K={K} Q={Q} episodes={n_eval}")
         metrics = eval_for_K(
             model,

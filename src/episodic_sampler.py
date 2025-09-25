@@ -1,28 +1,51 @@
-"""On-the-fly M-way K-shot episodic sampler from cached embeddings.
+"""On-the-fly M-way K-shot episodic sampler with rare-class fallback.
 
 Loads:
 - embeddings: contiguous memory-mapped arrays `embeddings.X.npy` (+ `embeddings.keys.npy`)
 - split JSONL files (train/val/test) mapping ec -> accessions
 
-Provides EpisodeSampler that returns support/query tensors and labels per episode.
+Supports:
+- identity-disjoint sampling via optional accession→cluster mapping
+- frequency-aware class sampling
+- targeted with-replacement fallback for under-filled classes (train only)
+- lightweight embedding-space augmentation to decorrelate duplicated samples
+- usage accounting with CSV export for diagnostics
 """
 from __future__ import annotations
 
+import csv
+import hashlib
 import json
+import math
 import random
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Set, DefaultDict
-from collections import defaultdict
+from typing import DefaultDict, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import torch
-from tqdm.auto import tqdm
+
+try:
+    from tqdm.auto import tqdm as _tqdm
+
+    def _progress_write(msg: str) -> None:
+        """Write sampler logs without breaking active tqdm bars."""
+
+        _tqdm.write(msg)
+
+except ImportError:  # pragma: no cover - tqdm is an optional runtime dep
+
+    def _progress_write(msg: str) -> None:
+        print(msg)
+
+from . import augment
 
 
 @dataclass
 class SplitIndex:
-    # ec class -> list of accessions
+    """Index of EC classes to accession lists."""
+
     by_class: Dict[str, List[str]]
     classes: List[str]
 
@@ -37,17 +60,7 @@ class SplitIndex:
 
 
 class EpisodeSampler:
-    """Samples episodes (M-way, K-shot, Q-queries per class).
-
-    Options:
-    - multi_label: if True, returns query_y as multi-hot [Nq, M] for multi-EC
-      evaluation/training within the episode (support_y remains single-class
-      indices for prototype construction per episode class).
-    - clusters_tsv: optional path to a two-column TSV "accession\tcluster_id"
-      used for identity-aware disjoint sampling of support/query pools.
-    - disjoint_support_query: if True and clusters are provided, queries are
-      preferentially drawn from clusters not used for supports within each class.
-    """
+    """Samples episodes (M-way, K-shot, Q queries per class)."""
 
     def __init__(
         self,
@@ -56,29 +69,50 @@ class EpisodeSampler:
         device: torch.device,
         seed: int = 42,
         *,
+        phase: str = "train",
         multi_label: bool = False,
         clusters_tsv: Optional[Path] = None,
         disjoint_support_query: bool = False,
+        with_replacement_fallback: bool = False,
+        fallback_scope: str = "train_only",
+        rare_class_boost: str = "none",
+        sequence_lookup: Optional[Dict[str, str]] = None,
+        usage_log_dir: Optional[Path] = None,
     ) -> None:
         self.device = device
+        self.phase = phase.lower()
+        self._base_seed = int(seed)
         self.rng = random.Random(seed)
+        self._np_rng = np.random.default_rng(seed)
         self.multi_label = bool(multi_label)
         self.disjoint_support_query = bool(disjoint_support_query)
 
-        # Normalize paths and derive contiguous array paths from the configured base
+        fallback_scope_norm = (fallback_scope or "train_only").lower().strip()
+        if fallback_scope_norm not in {"train_only", "all", "none"}:
+            fallback_scope_norm = "train_only"
+        self.fallback_scope = fallback_scope_norm
+        self.with_replacement_fallback = bool(with_replacement_fallback)
+        self.allow_fallback = self.with_replacement_fallback and (
+            (self.phase == "train" and self.fallback_scope in {"train_only", "all"})
+            or (self.phase != "train" and self.fallback_scope == "all")
+        )
+        self.rare_class_boost = (rare_class_boost or "none").lower().strip()
+        if self.rare_class_boost not in {"none", "inverse_log_freq"}:
+            self.rare_class_boost = "none"
+
+        # Embeddings (contiguous arrays)
         emb_path = Path(embeddings_npz)
         base_str = str(emb_path)
         if base_str.endswith(".npz"):
             base_str = base_str[:-4]
         X_path = Path(base_str + ".X.npy")
         keys_path = Path(base_str + ".keys.npy")
-
         if not (X_path.exists() and keys_path.exists()):
             raise FileNotFoundError(
                 f"[load-emb] contiguous embeddings not found. Expected: {X_path} and {keys_path}. "
                 f"Run the embedding step to generate them."
             )
-        # Memory-map contiguous arrays and build index
+
         self.X = np.load(X_path, mmap_mode="r")  # type: ignore[attr-defined]
         self.keys = np.load(keys_path, allow_pickle=False)  # type: ignore[attr-defined]
         if self.X.shape[0] != self.keys.shape[0]:
@@ -86,22 +120,23 @@ class EpisodeSampler:
                 f"[load-emb] X rows ({self.X.shape[0]}) != keys ({self.keys.shape[0]})"
             )
         print(f"[load-emb] using contiguous X.npy (mmap): shape={self.X.shape}")
-        # Build key → row index
         self.key2row: Dict[str, int] = {k: i for i, k in enumerate(self.keys.tolist())}  # type: ignore[attr-defined]
         self.dim = int(self.X.shape[1])
 
-        # Build split index and per-class pools using either indices or accessions
-        self.split = SplitIndex.from_jsonl(split_jsonl)
-        # Build acc -> set(ec) map within this split (for multi-label targets)
+        # Split/index structures
+        self.split = SplitIndex.from_jsonl(Path(split_jsonl))
         self.acc2ecs: Dict[str, Set[str]] = defaultdict(set)
         for ec, accs in self.split.by_class.items():
             for a in accs:
                 self.acc2ecs[a].add(ec)
         self.class2idx: Dict[str, List[int]] = {}
         for ec, accs in self.split.by_class.items():
-            self.class2idx[ec] = [self.key2row[a] for a in accs if a in self.key2row]
+            rows = [self.key2row[a] for a in accs if a in self.key2row]
+            if rows:
+                self.class2idx[ec] = rows
+        self.class_counts: Dict[str, int] = {ec: len(rows) for ec, rows in self.class2idx.items()}
 
-        # Optional: load clusters for identity-aware sampling
+        # Optional: accession → cluster map for identity-aware sampling
         self.acc2cluster: Dict[str, str] = {}
         if clusters_tsv is not None:
             p = Path(clusters_tsv)
@@ -118,99 +153,343 @@ class EpisodeSampler:
                     a, cid = parts[0], parts[1]
                     self.acc2cluster[a] = cid
 
-    def _pick_classes(self, M: int, min_examples: int = 1) -> List[str]:
-        classes = [
-            c
-            for c in self.split.classes
-            if len(self.class2idx.get(c, [])) >= max(1, min_examples)
-        ]
-        if len(classes) < M:
-            raise RuntimeError(
-                f"Not enough classes with embeddings: have {len(classes)}, need {M} (min_examples={min_examples})"
+        # Sequence lookup (needed for augmentation in fallback mode)
+        self.seq_lookup: Dict[str, str] = dict(sequence_lookup or {})
+        if self.allow_fallback and not self.seq_lookup:
+            print(
+                "[sampler] WARNING: fallback enabled but no sequence lookup provided; "
+                "fallback views will rely on stochastic noise only."
             )
-        self.rng.shuffle(classes)
-        return classes[:M]
+        self._warned_seq_missing = False
 
-    def sample_episode(self, M: int, K: int, Q: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, List[str]]:
-        """Sample a single episode.
+        # Usage accounting
+        self.usage_support_counts: DefaultDict[str, int] = defaultdict(int)
+        self.usage_query_counts: DefaultDict[str, int] = defaultdict(int)
+        self.fallback_per_ec: DefaultDict[str, int] = defaultdict(int)
+        self.total_support = 0
+        self.total_query = 0
+        self.fallback_events = 0
+        self._stats_dirty = False
+        self.usage_log_path = (usage_log_dir / "sampler_stats.csv") if usage_log_dir else None
 
-        Each class must provide at least ``K + Q`` distinct examples. If a class
-        has fewer available, a ``RuntimeError`` is raised.
+        # View augmentation hyper-parameters
+        self._view_dropout = 0.08
+        self._view_noise_sigma = 0.01
 
-        Args:
-            M: Number of classes.
-            K: Number of support samples per class. Must be positive.
-            Q: Number of query samples per class. Must be positive.
+    # ---------------------------------------------------------------------
+    # Helpers
+    # ---------------------------------------------------------------------
+    def _idx2acc(self, idx: int) -> str:
+        return str(self.keys[idx])  # type: ignore[index]
 
-        Raises:
-            ValueError: If ``K`` or ``Q`` is not a positive integer.
-            RuntimeError: If any class has fewer than ``K + Q`` samples.
-        """
+    def _class_weight(self, ec: str) -> float:
+        freq = max(1, self.class_counts.get(ec, 0))
+        if self.rare_class_boost == "inverse_log_freq":
+            denom = math.log(1.0 + float(freq))
+            return 1.0 / denom if denom > 0 else 0.0
+        return 1.0
+
+    def _pick_classes(self, M: int, need: int, allow_underfilled: bool) -> List[str]:
+        eligible: List[str] = []
+        for ec in self.split.classes:
+            count = self.class_counts.get(ec, 0)
+            if count == 0:
+                continue
+            if count >= need or allow_underfilled:
+                eligible.append(ec)
+        if len(eligible) < M:
+            raise RuntimeError(
+                f"Not enough classes with embeddings: have {len(eligible)}, need {M} (need={need}, allow_underfilled={allow_underfilled})"
+            )
+
+        if self.rare_class_boost == "inverse_log_freq":
+            weights = np.array([self._class_weight(ec) for ec in eligible], dtype=np.float64)
+            total = float(weights.sum())
+            if total <= 0:
+                pool = eligible[:]
+                self.rng.shuffle(pool)
+                return pool[:M]
+            probs = weights / total
+            chosen = self._np_rng.choice(eligible, size=M, replace=False, p=probs)
+            return chosen.tolist()
+
+        pool = eligible[:]
+        self.rng.shuffle(pool)
+        return pool[:M]
+
+    def _clusters_for(self, pool_idx: List[int]) -> Dict[str, List[int]]:
+        clusters: DefaultDict[str, List[int]] = defaultdict(list)
+        for i_row in pool_idx:
+            acc = self._idx2acc(i_row)
+            cid = self.acc2cluster.get(acc, f"_na_{i_row}")
+            clusters[cid].append(i_row)
+        return clusters
+
+    def _sample_standard(self, ec: str, pool_idx: List[int], K: int, Q: int) -> Tuple[List[int], List[int]]:
+        need = K + Q
+        if len(pool_idx) < need:
+            raise RuntimeError(
+                f"Class {ec} has only {len(pool_idx)} samples, requires {need} (no fallback allowed)."
+            )
+        if self.acc2cluster and self.disjoint_support_query:
+            clusters = self._clusters_for(pool_idx)
+            cids = list(clusters.keys())
+            self.rng.shuffle(cids)
+            support_idx: List[int] = []
+            used_cids: List[str] = []
+            for i in range(K):
+                cid = cids[i % len(cids)]
+                support_idx.append(self.rng.choice(clusters[cid]))
+                if cid not in used_cids:
+                    used_cids.append(cid)
+            remaining_cids = [c for c in cids if c not in used_cids]
+            query_idx: List[int] = []
+            if remaining_cids:
+                self.rng.shuffle(remaining_cids)
+                for i in range(Q):
+                    cid = remaining_cids[i % len(remaining_cids)]
+                    query_idx.append(self.rng.choice(clusters[cid]))
+            else:
+                pool_no_support = [idx for idx in pool_idx if idx not in support_idx]
+                for _ in range(Q):
+                    if pool_no_support:
+                        choice = pool_no_support.pop()
+                    else:
+                        choice = self.rng.choice(pool_idx)
+                    query_idx.append(choice)
+        else:
+            chosen = self.rng.sample(pool_idx, need)
+            support_idx = chosen[:K]
+            query_idx = chosen[K:]
+        return support_idx, query_idx
+
+    def _sample_with_replacement(self, ec: str, pool_idx: List[int], K: int, Q: int) -> Tuple[List[int], List[int]]:
+        if not pool_idx:
+            raise RuntimeError(f"Class {ec} has no embeddings available for fallback sampling")
+
+        if self.acc2cluster and self.disjoint_support_query:
+            clusters = self._clusters_for(pool_idx)
+            cids = list(clusters.keys())
+            if not cids:
+                # fall back to plain behaviour
+                return self._sample_with_replacement_plain(pool_idx, K, Q)
+            self.rng.shuffle(cids)
+            support_idx: List[int] = []
+            support_cids: List[str] = []
+            for _ in range(K):
+                cid = cids.pop(0) if cids else self.rng.choice(list(clusters.keys()))
+                support_idx.append(self.rng.choice(clusters[cid]))
+                support_cids.append(cid)
+                if cid not in cids:
+                    cids.append(cid)  # allow reuse when not enough clusters
+            remaining_cids = [cid for cid in clusters.keys() if cid not in support_cids]
+            self.rng.shuffle(remaining_cids)
+            query_idx: List[int] = []
+            while len(query_idx) < Q:
+                if remaining_cids:
+                    cid = remaining_cids.pop(0)
+                else:
+                    cid = self.rng.choice(list(clusters.keys()))
+                query_idx.append(self.rng.choice(clusters[cid]))
+                if cid not in remaining_cids and len(remaining_cids) + len(query_idx) < Q:
+                    remaining_cids.append(cid)
+            return support_idx, query_idx
+
+        return self._sample_with_replacement_plain(pool_idx, K, Q)
+
+    def _sample_with_replacement_plain(self, pool_idx: List[int], K: int, Q: int) -> Tuple[List[int], List[int]]:
+        pool = pool_idx[:]
+        self.rng.shuffle(pool)
+        support_idx: List[int] = []
+        query_idx: List[int] = []
+
+        available = pool[:]
+        while len(support_idx) < K:
+            if available:
+                support_idx.append(available.pop())
+            else:
+                support_idx.append(self.rng.choice(pool_idx))
+        available_for_query = [idx for idx in pool_idx if idx not in support_idx]
+        self.rng.shuffle(available_for_query)
+        while len(query_idx) < Q:
+            if available_for_query:
+                query_idx.append(available_for_query.pop())
+            else:
+                query_idx.append(self.rng.choice(pool_idx))
+        return support_idx, query_idx
+
+    def _rng_for_variant(self, acc: str, occurrence: int, seq_variant: Optional[str]) -> np.random.Generator:
+        base = f"{self._base_seed}|{acc}|{occurrence}|{seq_variant or ''}"
+        digest = hashlib.sha1(base.encode("utf-8")).digest()
+        seed = int.from_bytes(digest[:8], "big", signed=False)
+        return np.random.default_rng(seed)
+
+    def _augment_embedding(self, base: np.ndarray, rng_local: np.random.Generator) -> np.ndarray:
+        view = np.array(base, dtype=np.float32, copy=True)
+        if self._view_dropout > 0:
+            drop_mask = rng_local.random(view.shape[0]) < self._view_dropout
+            if drop_mask.all():
+                drop_mask[rng_local.integers(0, view.shape[0])] = False
+            view = np.where(drop_mask, 0.0, view)
+        if self._view_noise_sigma > 0:
+            noise = rng_local.normal(loc=0.0, scale=self._view_noise_sigma, size=view.shape[0])
+            view = view + noise.astype(np.float32)
+        base_norm = float(np.linalg.norm(base))
+        new_norm = float(np.linalg.norm(view))
+        if base_norm > 0 and new_norm > 0:
+            view = view * (base_norm / new_norm)
+        return view.astype(np.float32, copy=False)
+
+    def _views_for_index(self, idx: int, count: int) -> List[np.ndarray]:
+        base = np.array(self.X[idx], dtype=np.float32, copy=True)  # type: ignore[index]
+        if count <= 1:
+            return [base]
+        acc = self._idx2acc(idx)
+        seq = self.seq_lookup.get(acc)
+        variants: List[np.ndarray] = [base]
+        variant_occurrence = 1
+        while len(variants) < count:
+            if seq:
+                view_a, view_b = augment.make_two_views(seq, rng=self.rng)
+                for seq_variant in (view_a, view_b):
+                    rng_local = self._rng_for_variant(acc, variant_occurrence, seq_variant)
+                    variants.append(self._augment_embedding(base, rng_local))
+                    variant_occurrence += 1
+                    if len(variants) >= count:
+                        break
+                seq = view_a  # feed augmented sequence forward for diversity
+            else:
+                rng_local = self._rng_for_variant(acc, variant_occurrence, None)
+                variants.append(self._augment_embedding(base, rng_local))
+                variant_occurrence += 1
+        return variants[:count]
+
+    def _take_view(
+        self,
+        cache: Dict[int, List[np.ndarray]],
+        occurrences: DefaultDict[int, int],
+        idx: int,
+    ) -> np.ndarray:
+        views = cache.get(idx)
+        if views is None:
+            views = self._views_for_index(idx, 1)
+            cache[idx] = views
+        pos = occurrences[idx]
+        occurrences[idx] += 1
+        if pos >= len(views):
+            views = self._views_for_index(idx, pos + 1)
+            cache[idx] = views
+        return views[pos]
+
+    def _log_fallback(self, ec: str, have: int, need: int) -> None:
+        self.fallback_events += 1
+        if self.fallback_events <= 5 or self.fallback_events % 50 == 0:
+            _progress_write(
+                f"[sampler][{self.phase}] fallback triggered for EC {ec}: "
+                f"available={have}, need={need}"
+            )
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def sample_episode(
+        self,
+        M: int,
+        K: int,
+        Q: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, List[str]]:
         if K <= 0 or Q <= 0:
             raise ValueError("K and Q must be positive integers")
         need = K + Q
-        classes = self._pick_classes(M, min_examples=need)
-        support_x, support_y, query_x, query_y = [], [], [], []
-        query_multi: List[List[int]] = []  # used only if multi_label
+        allow_underfilled = self.allow_fallback
+        classes = self._pick_classes(M, need, allow_underfilled)
+
+        support_x: List[np.ndarray] = []
+        support_y: List[int] = []
+        query_x: List[np.ndarray] = []
+        query_y: List[int] = []
+        query_multi: List[List[int]] = []
+        view_cache: Dict[int, List[np.ndarray]] = {}
+        occurrences: DefaultDict[int, int] = defaultdict(int)
+
         for label, ec in enumerate(classes):
             pool_idx = self.class2idx.get(ec, [])
-            if len(pool_idx) == 0:
+            if not pool_idx:
                 raise RuntimeError(f"No embeddings for class {ec}")
-            if len(pool_idx) < need:
-                raise RuntimeError(
-                    f"Class {ec} has only {len(pool_idx)} samples, but requires at least {need} (K + Q)"
-                )
-            # Helper to get accession for a row
-            def idx2acc(i_row: int) -> str:
-                return str(self.keys[i_row])  # type: ignore[attr-defined]
-            if self.acc2cluster and self.disjoint_support_query:
-                # Group by cluster
-                clusters: DefaultDict[str, List[int]] = defaultdict(list)
-                for i_row in pool_idx:
-                    clusters[self.acc2cluster.get(idx2acc(i_row), f"_na_{i_row}")].append(i_row)
-                cids = list(clusters.keys())
-                self.rng.shuffle(cids)
-                # Pick support from distinct clusters (with replacement if few)
-                s_idx: List[int] = []
-                if len(cids) > 0:
-                    for ii in range(K):
-                        cid = cids[ii % len(cids)]
-                        s_idx.append(self.rng.choice(clusters[cid]))
-                    used = set(cids[: min(K, len(cids))])
-                else:
-                    s_idx = [self.rng.choice(pool_idx) for _ in range(K)]
-                    used = set()
-                # Queries prefer clusters not used for support
-                rem_cids = [c for c in cids if c not in used]
-                q_idx: List[int] = []
-                if len(rem_cids) > 0:
-                    self.rng.shuffle(rem_cids)
-                    for ii in range(Q):
-                        cid = rem_cids[ii % len(rem_cids)]
-                        q_idx.append(self.rng.choice(clusters[cid]))
-                else:
-                    # fallback: sample from any cluster
-                    q_idx = [self.rng.choice(pool_idx) for _ in range(Q)]
+            count = len(pool_idx)
+            use_fallback = count < need and self.allow_fallback
+            if use_fallback:
+                s_idx, q_idx = self._sample_with_replacement(ec, pool_idx, K, Q)
+                self._log_fallback(ec, count, need)
+                self.fallback_per_ec[ec] += 1
             else:
-                chosen = self.rng.sample(pool_idx, need)
-                s_idx = chosen[:K]
-                q_idx = chosen[K:]
+                s_idx, q_idx = self._sample_standard(ec, pool_idx, K, Q)
+                if self.disjoint_support_query:
+                    overlap = set(s_idx).intersection(q_idx)
+                    if overlap:
+                        raise AssertionError(
+                            f"support/query overlap without fallback for EC {ec}: {overlap}"
+                        )
+            combined = s_idx + q_idx
+            if use_fallback:
+                counts = Counter(combined)
+                for idx, cnt in counts.items():
+                    if cnt > 1:
+                        view_cache[idx] = self._views_for_index(idx, cnt)
+            self.usage_support_counts[ec] += len(s_idx)
+            self.usage_query_counts[ec] += len(q_idx)
+            self.total_support += len(s_idx)
+            self.total_query += len(q_idx)
+
             for i_row in s_idx:
-                support_x.append(self.X[i_row])  # type: ignore[attr-defined]
+                vec = self._take_view(view_cache, occurrences, i_row)
+                support_x.append(vec)
                 support_y.append(label)
             for i_row in q_idx:
-                query_x.append(self.X[i_row])  # type: ignore[attr-defined]
+                vec = self._take_view(view_cache, occurrences, i_row)
+                query_x.append(vec)
                 if not self.multi_label:
                     query_y.append(label)
                 else:
-                    acc = idx2acc(i_row)
+                    acc = self._idx2acc(i_row)
                     row = [1 if ec2 in self.acc2ecs.get(acc, set()) else 0 for ec2 in classes]
                     query_multi.append(row)
+
+        self._stats_dirty = True
+
         sx = torch.from_numpy(np.stack(support_x).astype(np.float32)).to(self.device)
         qx = torch.from_numpy(np.stack(query_x).astype(np.float32)).to(self.device)
         sy = torch.tensor(support_y, dtype=torch.long, device=self.device)
         if self.multi_label:
-            qy = torch.tensor(np.array(query_multi, dtype=np.float32), dtype=torch.float32, device=self.device)
+            qy_np = np.array(query_multi, dtype=np.float32)
+            qy = torch.tensor(qy_np, dtype=torch.float32, device=self.device)
         else:
             qy = torch.tensor(query_y, dtype=torch.long, device=self.device)
         return sx, sy, qx, qy, classes
+
+    def write_usage_csv(self, target_dir: Optional[Path] = None) -> Optional[Path]:
+        if not self._stats_dirty and target_dir is None and self.usage_log_path is None:
+            return None
+        out_path = None
+        if target_dir is not None:
+            out_path = Path(target_dir) / "sampler_stats.csv"
+        elif self.usage_log_path is not None:
+            out_path = self.usage_log_path
+        if out_path is None:
+            return None
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["ec", "support_count", "query_count", "fallback_episodes"])
+            for ec in sorted(self.split.classes):
+                writer.writerow(
+                    [
+                        ec,
+                        int(self.usage_support_counts.get(ec, 0)),
+                        int(self.usage_query_counts.get(ec, 0)),
+                        int(self.fallback_per_ec.get(ec, 0)),
+                    ]
+                )
+        self._stats_dirty = False
+        print(f"[sampler] wrote usage stats → {out_path}")
+        return out_path

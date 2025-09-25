@@ -62,6 +62,27 @@ python -m src.eval_protonet -c config.yaml
 ```
 Writes `results/metrics.json` keyed by K. In multi-label mode: top-1 hit accuracy (prediction counted correct if top-1 is among true labels) plus micro/macro precision/recall/F1. In single-label mode: accuracy and macro-F1.
 
+## Global-Support Evaluation (All ECs)
+
+Construct a global prototype bank from the training split and evaluate queries against all ECs simultaneously.
+
+1. **Build prototypes from train-only supports**
+   ```bash
+   python scripts/build_prototypes.py --config config.yaml --out artifacts/prototypes.npz
+   ```
+
+2. **Evaluate with global-support scoring**
+   ```bash
+   python scripts/eval_global.py --config config.yaml --protos artifacts/prototypes.npz --split test
+   ```
+   Outputs per-metric JSON to `results/global_metrics.json` and prints micro/macro precision/recall/F1, plus head/medium/tail bucket summaries based on training frequencies.
+
+3. **(Optional) Tune thresholds on a dev split**
+   ```bash
+   python scripts/tune_tau.py --config config.yaml --protos artifacts/prototypes.npz --split val --out artifacts/calibration.json
+   ```
+   The generated `calibration.json` is auto-consumed by `scripts/eval_global.py` (and `src.eval_protonet --mode global_support`) unless overridden on the CLI.
+
 ## Multi-EC Detector Cascade (optional)
 - Enable the detector head during training with `detector.enabled: true`. Its BCE loss is weighted by `detector.loss_weight` and the head uses a single hidden layer of size `detector.hidden_dim`.
 - Turn on gating at evaluation time by setting `cascade.enabled: true`. The detector's sigmoid score is compared against `detector.thresh`; when it wins, query logits are thresholded with `tau_multi` to emit multiple ECs (with an argmax fallback if none exceed the threshold). Otherwise the evaluation sticks to the single top-1 label.

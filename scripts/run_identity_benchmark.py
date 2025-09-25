@@ -94,6 +94,19 @@ def main() -> None:
             run_cfg["paths"]["clusters_tsv"] = str((split_dir / "clusters.tsv").resolve())
             # Ensure identity disjoint during episodes
             run_cfg["identity_disjoint"] = True
+
+            eval_cfg = run_cfg.get("eval") or {}
+            mode = str(eval_cfg.get("mode", "episodic"))
+            outputs_path = Path(run_cfg["paths"]["outputs"]).resolve()
+            if mode == "global_support":
+                proto_path = outputs_path / "prototypes.npz"
+                calib_path = outputs_path / "calibration.json"
+                eval_cfg = dict(eval_cfg)
+                eval_cfg["prototypes_path"] = str(proto_path)
+                eval_cfg.setdefault("calibration_path", str(calib_path))
+                run_cfg["eval"] = eval_cfg
+            else:
+                proto_path = None
             # Create temp config
             cfg_path = tmp_cfg_dir / f"run_id{pct}_fold{fi+1}.yaml"
             dump_cfg(run_cfg, cfg_path)
@@ -132,6 +145,15 @@ def main() -> None:
                     _np.save(Kp, _np.array(keys, dtype="U"))
                     print(f"[benchmark] Wrote synthetic embeddings: N={len(keys)} D={D} → {Xp}, {Kp}")
             run(["python", "-m", "src.train_protonet", "-c", str(cfg_path)])
+            if proto_path is not None:
+                run([
+                    "python",
+                    "scripts/build_prototypes.py",
+                    "--config",
+                    str(cfg_path),
+                    "--out",
+                    str(proto_path),
+                ])
             # Skip eval if test split has no classes
             test_jsonl = Path(run_cfg["paths"]["splits_dir"]) / "test.jsonl"
             nonempty = False
@@ -150,9 +172,54 @@ def main() -> None:
                     json.dump({}, f)
 
             # Enrich per-fold metrics with context and counts
-            metrics_path = Path(run_cfg["paths"]["outputs"]) / "metrics.json"
-            with open(metrics_path, "r") as f:
+            outputs_dir = Path(run_cfg["paths"]["outputs"])
+            metrics_path = outputs_dir / "metrics.json"
+            raw_metrics_path = metrics_path
+            if not raw_metrics_path.exists():
+                fallback_candidates = [
+                    outputs_dir / "global_metrics.json",
+                    outputs_dir / "metrics_global.json",
+                ]
+                for cand in fallback_candidates:
+                    if cand.exists():
+                        raw_metrics_path = cand
+                        print(
+                            f"[benchmark] metrics.json missing; ingesting metrics from {cand.name}."
+                        )
+                        break
+            if not raw_metrics_path.exists():
+                available = ", ".join(
+                    sorted(str(p.name) for p in outputs_dir.glob("*.json"))
+                )
+                raise FileNotFoundError(
+                    f"No metrics file found for outputs at {outputs_dir}."
+                    + (f" Available JSON files: {available}" if available else "")
+                )
+            with open(raw_metrics_path, "r", encoding="utf-8") as f:
                 raw_metrics = json.load(f)
+
+            def _unwrap_metrics(obj: Any) -> Any:
+                depth = 0
+                current = obj
+                while (
+                    isinstance(current, dict)
+                    and "metrics" in current
+                    and isinstance(current["metrics"], dict)
+                    and depth < 10
+                ):
+                    current = current["metrics"]
+                    depth += 1
+                return current
+
+            raw_metrics = _unwrap_metrics(raw_metrics)
+            # Normalize metrics so downstream aggregation expects a dict-of-dicts
+            if isinstance(raw_metrics, dict):
+                if raw_metrics and all(not isinstance(v, dict) for v in raw_metrics.values()):
+                    raw_metrics = {"global": raw_metrics}
+            elif isinstance(raw_metrics, list):
+                raw_metrics = {"global": {"values": raw_metrics}}
+            else:
+                raw_metrics = {"global": {"value": raw_metrics}}
 
             # Counts by cluster assignment
             fold_clusters = list(folds_info["folds"].get(str(fi+1), []))

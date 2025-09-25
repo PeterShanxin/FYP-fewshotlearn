@@ -61,10 +61,35 @@ def extract_metric(summary: Dict, metric_key: str, K_key: str = "K=1") -> Tuple[
     means, cis = [], []
     for t in ths:
         tkey = str(t)
-        agg = summary[tkey]["aggregate"][K_key]
-        means.append(float(agg[f"mean_{metric_key}"]))
-        cis.append(float(agg[f"ci95_{metric_key}"]))
+        agg_all = summary[tkey].get("aggregate", {})
+        epi = agg_all.get("episodic", agg_all)
+        block = epi.get(K_key)
+        if not isinstance(block, dict):
+            means.append(float("nan"))
+            cis.append(0.0)
+            continue
+        means.append(float(block.get(f"mean_{metric_key}", float("nan"))))
+        cis.append(float(block.get(f"ci95_{metric_key}", 0.0)))
     return ths, means, cis
+
+
+def extract_global_metric(summary: Dict, metric_key: str) -> Tuple[List[int], List[float], List[float], bool]:
+    ths = list_thresholds(summary)
+    means, cis = [], []
+    any_available = False
+    for t in ths:
+        tkey = str(t)
+        agg_all = summary[tkey].get("aggregate", {})
+        glob = agg_all.get("global", {})
+        entry = glob.get(metric_key)
+        if isinstance(entry, dict) and entry:
+            means.append(float(entry.get("mean", float("nan"))))
+            cis.append(float(entry.get("ci95", 0.0)))
+            any_available = True
+        else:
+            means.append(float("nan"))
+            cis.append(0.0)
+    return ths, means, cis, any_available
 
 
 def count_clusters(tsv_path: Path) -> int:
@@ -108,12 +133,13 @@ def collect_per_fold_metric(results_dir: Path, thresholds: List[int], metric_key
             except Exception:
                 continue
             met = obj.get("metrics", {})
-            if "K=1" in met:
-                v = met["K=1"].get(metric_key)
+            epi = met.get("episodic", met)
+            if "K=1" in epi:
+                v = epi["K=1"].get(metric_key)
                 if v is not None:
                     k1[t].append(float(v))
-            if "K=5" in met:
-                v = met["K=5"].get(metric_key)
+            if "K=5" in epi:
+                v = epi["K=5"].get(metric_key)
                 if v is not None:
                     k5[t].append(float(v))
     return k1, k5
@@ -124,8 +150,15 @@ def plot_line_with_ci(ax, x: List[int], y: List[float], ci: List[float], label: 
     x = _np.asarray(x)
     y = _np.asarray(y)
     ci = _np.asarray(ci)
+    mask = ~_np.isnan(y)
+    if not mask.any():
+        return False
+    x = x[mask]
+    y = y[mask]
+    ci = ci[mask]
     ax.plot(x, y, marker="o", label=label, color=color)
     ax.fill_between(x, y - ci, y + ci, alpha=0.2, color=color)
+    return True
 
 
 def grouped_boxplot(ax, thresholds: List[int], data_a: Dict[int, List[float]], data_b: Dict[int, List[float]], labels=("K=1", "K=5")):
@@ -260,6 +293,25 @@ def main() -> None:
     fig.savefig(out_dir / "micro_f1_vs_threshold.png", dpi=args.dpi)
     figs.append(fig)
 
+    g_ths, g_micro, g_micro_ci, has_micro = extract_global_metric(summary, "micro_f1")
+    _, g_macro, g_macro_ci, has_macro = extract_global_metric(summary, "macro_f1")
+    if has_micro or has_macro:
+        fig, ax = plt.subplots(figsize=(7, 4))
+        plotted = False
+        if has_micro:
+            plotted |= bool(plot_line_with_ci(ax, g_ths, g_micro, g_micro_ci, label="Global Micro-F1", color="#54A24B"))
+        if has_macro:
+            plotted |= bool(plot_line_with_ci(ax, g_ths, g_macro, g_macro_ci, label="Global Macro-F1", color="#E45756"))
+        ax.set_title("Global Support F1 vs. Identity Threshold")
+        ax.set_xlabel("Identity threshold (%)")
+        ax.set_ylabel("F1 (mean ± 95% CI)")
+        ax.grid(True, alpha=0.3)
+        if plotted:
+            ax.legend()
+        fig.tight_layout()
+        fig.savefig(out_dir / "global_f1_vs_threshold.png", dpi=args.dpi)
+        figs.append(fig)
+
     # 3) Precision/Recall vs threshold (macro)
     ths, mp_1, mpci1 = extract_metric(summary, "macro_precision", "K=1")
     _, mp_5, mpci5 = extract_metric(summary, "macro_precision", "K=5")
@@ -274,6 +326,21 @@ def main() -> None:
     fig.tight_layout()
     fig.savefig(out_dir / "macro_precision_vs_threshold.png", dpi=args.dpi)
     figs.append(fig)
+
+    coverage_ths, coverage_means, coverage_ci, has_coverage = extract_global_metric(summary, "coverage_ratio")
+    if has_coverage:
+        fig, ax = plt.subplots(figsize=(7, 4))
+        plotted = bool(plot_line_with_ci(ax, coverage_ths, coverage_means, coverage_ci, label="Coverage", color="#B279A2"))
+        ax.set_title("Global Support Coverage vs. Identity Threshold")
+        ax.set_xlabel("Identity threshold (%)")
+        ax.set_ylabel("Coverage ratio (evaluated queries / total)")
+        ax.set_ylim(0.0, 1.05)
+        ax.grid(True, alpha=0.3)
+        if plotted:
+            ax.legend()
+        fig.tight_layout()
+        fig.savefig(out_dir / "global_coverage_vs_threshold.png", dpi=args.dpi)
+        figs.append(fig)
 
     ths, mr_1, mrci1 = extract_metric(summary, "macro_recall", "K=1")
     _, mr_5, mrci5 = extract_metric(summary, "macro_recall", "K=5")
@@ -315,12 +382,27 @@ def main() -> None:
     figs.append(fig)
 
     # 6) Print a short textual summary for quick sense-making
+    def _clean(values: List[float]) -> np.ndarray:
+        arr = np.asarray(values, dtype=float)
+        return arr[~np.isnan(arr)]
+
     def describe_change(name: str, y1: List[float], y5: List[float]) -> str:
-        if not y1 or not y5:
+        arr1 = _clean(y1)
+        arr5 = _clean(y5)
+        if arr1.size == 0 or arr5.size == 0:
             return f"- {name}: insufficient data"
         return (
-            f"- {name}: K=1 mean {np.mean(y1):.3f} → K=5 mean {np.mean(y5):.3f} "
-            f"(Δ={np.mean(y5)-np.mean(y1):+.3f})"
+            f"- {name}: K=1 mean {arr1.mean():.3f} → K=5 mean {arr5.mean():.3f} "
+            f"(Δ={arr5.mean()-arr1.mean():+.3f})"
+        )
+
+    def describe_global(name: str, values: List[float], fmt: str = "{:.3f}") -> str:
+        arr = _clean(values)
+        if arr.size == 0:
+            return f"- {name}: unavailable"
+        return (
+            f"- {name}: mean {fmt.format(arr.mean())} "
+            f"(min {fmt.format(arr.min())}, max {fmt.format(arr.max())})"
         )
 
     print("\n[visualize] Summary (means across thresholds):")
@@ -329,7 +411,10 @@ def main() -> None:
     s_mp = describe_change("Macro-Precision", mp_1, mp_5)
     s_mr = describe_change("Macro-Recall", mr_1, mr_5)
     s_clu = f"- #Clusters {cluster_trend} with threshold: " + " → ".join(str(c) for c in cluster_counts)
-    for line in (s_acc, s_mf1, s_mp, s_mr, s_clu):
+    s_gmicro = describe_global("Global micro-F1", g_micro)
+    s_gmacro = describe_global("Global macro-F1", g_macro)
+    s_cov = describe_global("Global coverage", coverage_means, fmt="{:.1%}")
+    for line in (s_acc, s_mf1, s_mp, s_mr, s_gmicro, s_gmacro, s_cov, s_clu):
         print(line)
     print(f"[visualize] Wrote figures to: {out_dir.resolve()}")
 
@@ -347,6 +432,10 @@ def main() -> None:
         text_lines.append(s_mf1)
         text_lines.append(s_mp)
         text_lines.append(s_mr)
+        text_lines.append("")
+        text_lines.append(s_gmicro)
+        text_lines.append(s_gmacro)
+        text_lines.append(s_cov)
         text_lines.append(s_clu)
         body = "\n".join(text_lines)
         fig_sum.text(0.06, 0.90, "Overview", fontsize=12, fontweight="bold", va="top")

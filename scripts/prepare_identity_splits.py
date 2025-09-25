@@ -398,6 +398,19 @@ def main() -> None:
         target_labels = {k: v / F for k, v in total_labels.items()}
         target_size = target_total / F
         order = sorted(cluster_ids, key=lambda x: (-cl_size[x], x))
+
+        # Seed each fold with one of the largest clusters to avoid empty folds.
+        seeded = 0
+        seed_total = min(F, len(order))
+        for fi in range(seed_total):
+            cid = order[fi]
+            folds[fi].append(cid)
+            fold_size[fi] += cl_size[cid]
+            for k, v in cl_label[cid].items():
+                fold_label[fi][k] += v
+            seeded += 1
+        # Skip seeded clusters during the main assignment loop.
+        order = order[seeded:]
         def score_fold(fi: int, cid: str) -> float:
             sse = 0.0
             keys = set(fold_label[fi].keys()) | set(cl_label[cid].keys())
@@ -410,9 +423,12 @@ def main() -> None:
             sse += (sz - target_size) ** 2
             return sse
         for cid in order:
-            scores = [(score_fold(fi, cid), fi) for fi in range(F)]
+            scores = [
+                (score_fold(fi, cid), fold_size[fi], fi)
+                for fi in range(F)
+            ]
             scores.sort()
-            best_fi = scores[0][1]
+            best_fi = scores[0][2]
             folds[best_fi].append(cid)
             fold_size[best_fi] += cl_size[cid]
             for k, v in cl_label[cid].items():

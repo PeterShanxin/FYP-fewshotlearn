@@ -84,6 +84,9 @@ folds: 3
 identity_definition: tool_default
 clustering_method: existing_id_cluster_module
 stratify_by: EC_top
+identity_benchmark:
+  episodic: true
+  global_support: true
 
 # Fetch fresh data in smoke as well (small run)
 force_fetch: false

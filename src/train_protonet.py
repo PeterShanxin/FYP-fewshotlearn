@@ -278,7 +278,19 @@ def main() -> None:
     model = ProtoNet(pcfg).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
     use_amp = bool(cfg.get("fp16_train", False)) and device.type == "cuda"
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    # Torch 2.x introduces torch.amp.GradScaler with a device_type argument; older
+    # releases only provide torch.cuda.amp.GradScaler without that parameter. Pick
+    # whichever variant is available to stay compatible across versions.
+    amp_mod = getattr(torch, "amp", None)
+    if amp_mod is not None and hasattr(amp_mod, "GradScaler"):
+        grad_scaler_cls = amp_mod.GradScaler
+    else:
+        grad_scaler_cls = torch.cuda.amp.GradScaler
+
+    try:
+        scaler = grad_scaler_cls(device_type=device.type, enabled=use_amp)
+    except TypeError:
+        scaler = grad_scaler_cls(enabled=use_amp)
     det_loss_fn = torch.nn.BCEWithLogitsLoss() if detector_enabled else None
 
     n_train = int(cfg["episodes"]["train"])

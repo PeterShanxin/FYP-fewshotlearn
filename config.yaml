@@ -97,6 +97,9 @@ folds: 5
 identity_definition: tool_default      # global_pairwise | local_pairwise | tool_default
 clustering_method: existing_id_cluster_module
 stratify_by: EC_top
+identity_benchmark:
+  episodic: true
+  global_support: true
 
 # Data filtering and splits
 min_sequences_per_class_for_train: 1

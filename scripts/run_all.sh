@@ -303,6 +303,20 @@ PY
 )
 EOF
 
+RESULTS_DIR=$(python - "${CFG}" <<'PY'
+import sys
+from pathlib import Path
+import yaml
+
+cfg_path = Path(sys.argv[1])
+with open(cfg_path, 'r', encoding='utf-8') as f:
+    cfg = yaml.safe_load(f) or {}
+paths = cfg.get('paths', {}) or {}
+out_dir = Path(paths.get('outputs', 'results')).resolve()
+print(out_dir)
+PY
+)
+
 if [ "$HAVE_CACHED_SPLITS" = "1" ]; then
   echo "[run_all] Reusing cached identity splits for thresholds ${CUTOFFS_PCT_STR}% (folds=${FOLDS})."
   SKIP_PREPARE_FLAG="--skip_prepare"
@@ -312,4 +326,39 @@ else
 fi
 
 python scripts/run_identity_benchmark.py -c "${CFG}" --cutoffs "${CUTOFFS}" --folds "${FOLDS}" ${FE_FLAG} ${SKIP_PREPARE_FLAG}
+
+if python - <<'PY'
+try:
+    import importlib
+    importlib.import_module('matplotlib')
+except Exception:
+    raise SystemExit(1)
+raise SystemExit(0)
+PY
+then
+  echo "[run_all][viz] Generating identity benchmark report"
+  python scripts/visualize_identity_benchmark.py --results_dir "${RESULTS_DIR}" --out_dir "${RESULTS_DIR}/figures"
+else
+  echo "[run_all][viz][note] matplotlib unavailable; attempting install"
+  # Try to install matplotlib into the current environment, then retry
+  if python -m pip install -q matplotlib >/dev/null 2>&1; then
+    if python - <<'PY'
+try:
+    import importlib
+    importlib.import_module('matplotlib')
+except Exception:
+    raise SystemExit(1)
+raise SystemExit(0)
+PY
+    then
+      echo "[run_all][viz] matplotlib installed; generating identity benchmark report"
+      python scripts/visualize_identity_benchmark.py --results_dir "${RESULTS_DIR}" --out_dir "${RESULTS_DIR}/figures"
+    else
+      echo "[run_all][viz][note] matplotlib import still failing after install; skipping report"
+    fi
+  else
+    echo "[run_all][viz][note] pip install failed; skipping identity benchmark report"
+  fi
+fi
+
 completed=1

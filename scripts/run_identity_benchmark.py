@@ -47,6 +47,18 @@ def main() -> None:
     args = ap.parse_args()
 
     base_cfg = load_cfg(args.config)
+    bench_cfg = base_cfg.get("identity_benchmark", {}) or {}
+    run_episodic = bool(bench_cfg.get("episodic", True))
+    run_global = bool(bench_cfg.get("global_support", True))
+    if not (run_episodic or run_global):
+        print("[benchmark][warn] identity_benchmark requested neither episodic nor global evaluation; defaulting to episodic=true.")
+        run_episodic = True
+    mode_labels = []
+    if run_episodic:
+        mode_labels.append("episodic")
+    if run_global:
+        mode_labels.append("global_support")
+    print(f"[benchmark] evaluation modes: {', '.join(mode_labels)}")
     out_root = Path(base_cfg["paths"].get("outputs", "results")).resolve()
     results_root = out_root
     results_root.mkdir(parents=True, exist_ok=True)
@@ -95,18 +107,17 @@ def main() -> None:
             # Ensure identity disjoint during episodes
             run_cfg["identity_disjoint"] = True
 
-            eval_cfg = run_cfg.get("eval") or {}
-            mode = str(eval_cfg.get("mode", "episodic"))
+            eval_cfg = dict(run_cfg.get("eval") or {})
             outputs_path = Path(run_cfg["paths"]["outputs"]).resolve()
-            if mode == "global_support":
+            proto_path = None
+            if run_global:
                 proto_path = outputs_path / "prototypes.npz"
                 calib_path = outputs_path / "calibration.json"
-                eval_cfg = dict(eval_cfg)
+                # Always override per-fold artifact destinations so evaluation reads the
+                # prototypes written for this split instead of any global default.
                 eval_cfg["prototypes_path"] = str(proto_path)
-                eval_cfg.setdefault("calibration_path", str(calib_path))
-                run_cfg["eval"] = eval_cfg
-            else:
-                proto_path = None
+                eval_cfg["calibration_path"] = str(calib_path)
+            run_cfg["eval"] = eval_cfg
             # Create temp config
             cfg_path = tmp_cfg_dir / f"run_id{pct}_fold{fi+1}.yaml"
             dump_cfg(run_cfg, cfg_path)
@@ -162,64 +173,110 @@ def main() -> None:
                     for _ in f:
                         nonempty = True
                         break
-            if nonempty:
-                run(["python", "-m", "src.eval_protonet", "-c", str(cfg_path)])
-            else:
-                # Write an empty metrics skeleton to keep pipeline flowing
-                outp = Path(run_cfg["paths"]["outputs"]) / "metrics.json"
-                outp.parent.mkdir(parents=True, exist_ok=True)
-                with open(outp, "w", encoding="utf-8") as f:
-                    json.dump({}, f)
-
-            # Enrich per-fold metrics with context and counts
             outputs_dir = Path(run_cfg["paths"]["outputs"])
             metrics_path = outputs_dir / "metrics.json"
-            raw_metrics_path = metrics_path
-            if not raw_metrics_path.exists():
-                fallback_candidates = [
-                    outputs_dir / "global_metrics.json",
-                    outputs_dir / "metrics_global.json",
-                ]
-                for cand in fallback_candidates:
-                    if cand.exists():
-                        raw_metrics_path = cand
-                        print(
-                            f"[benchmark] metrics.json missing; ingesting metrics from {cand.name}."
-                        )
-                        break
-            if not raw_metrics_path.exists():
-                available = ", ".join(
-                    sorted(str(p.name) for p in outputs_dir.glob("*.json"))
-                )
-                raise FileNotFoundError(
-                    f"No metrics file found for outputs at {outputs_dir}."
-                    + (f" Available JSON files: {available}" if available else "")
-                )
-            with open(raw_metrics_path, "r", encoding="utf-8") as f:
-                raw_metrics = json.load(f)
+            global_metrics_path = outputs_dir / "global_metrics.json"
 
-            def _unwrap_metrics(obj: Any) -> Any:
-                depth = 0
-                current = obj
-                while (
-                    isinstance(current, dict)
-                    and "metrics" in current
-                    and isinstance(current["metrics"], dict)
-                    and depth < 10
-                ):
-                    current = current["metrics"]
-                    depth += 1
-                return current
+            eval_commands: List[Tuple[str, List[str]]] = []
+            if run_episodic:
+                eval_commands.append(
+                    (
+                        "episodic",
+                        ["python", "-m", "src.eval_protonet", "-c", str(cfg_path), "--mode", "episodic"],
+                    )
+                )
+            if run_global:
+                eval_commands.append(
+                    (
+                        "global_support",
+                        [
+                            "python",
+                            "-m",
+                            "src.eval_protonet",
+                            "-c",
+                            str(cfg_path),
+                            "--mode",
+                            "global_support",
+                        ],
+                    )
+                )
 
-            raw_metrics = _unwrap_metrics(raw_metrics)
-            # Normalize metrics so downstream aggregation expects a dict-of-dicts
-            if isinstance(raw_metrics, dict):
-                if raw_metrics and all(not isinstance(v, dict) for v in raw_metrics.values()):
-                    raw_metrics = {"global": raw_metrics}
-            elif isinstance(raw_metrics, list):
-                raw_metrics = {"global": {"values": raw_metrics}}
+            if nonempty:
+                for label, cmd in eval_commands:
+                    print(f"[benchmark][eval] mode={label} cutoff={pct} fold={fi+1}")
+                    run(cmd)
             else:
-                raw_metrics = {"global": {"value": raw_metrics}}
+                metrics_path.parent.mkdir(parents=True, exist_ok=True)
+                if run_episodic:
+                    with open(metrics_path, "w", encoding="utf-8") as f:
+                        json.dump({}, f)
+                if run_global:
+                    with open(global_metrics_path, "w", encoding="utf-8") as f:
+                        json.dump({}, f)
+
+            episodic_metrics: Dict[str, Any] | None = None
+            global_metrics: Dict[str, Any] | None = None
+
+            if metrics_path.exists():
+                with open(metrics_path, "r", encoding="utf-8") as f:
+                    episodic_raw = json.load(f)
+
+                def _unwrap_metrics(obj: Any) -> Any:
+                    depth = 0
+                    current = obj
+                    while (
+                        isinstance(current, dict)
+                        and "metrics" in current
+                        and isinstance(current["metrics"], dict)
+                        and depth < 10
+                    ):
+                        current = current["metrics"]
+                        depth += 1
+                    return current
+
+                extracted = _unwrap_metrics(episodic_raw)
+                if isinstance(extracted, dict) and extracted:
+                    if "episodic" in extracted and isinstance(extracted["episodic"], dict):
+                        episodic_metrics = extracted["episodic"]
+                    elif all(isinstance(v, dict) for v in extracted.values()):
+                        episodic_metrics = extracted
+                    if global_metrics is None and "global" in extracted and isinstance(extracted["global"], dict):
+                        global_metrics = extracted["global"]
+
+            if global_metrics_path.exists():
+                with open(global_metrics_path, "r", encoding="utf-8") as f:
+                    gm = json.load(f)
+                    if isinstance(gm, dict) and gm:
+                        global_metrics = gm
+
+            if run_episodic and episodic_metrics is None:
+                if nonempty:
+                    print(
+                        f"[benchmark][warn] episodic metrics missing for outputs at {outputs_dir}; expected metrics.json"
+                    )
+                else:
+                    print(
+                        f"[benchmark][info] skipped episodic metrics for {outputs_dir} because the test split is empty"
+                    )
+            if run_global and global_metrics is None:
+                if nonempty:
+                    print(
+                        f"[benchmark][warn] global metrics missing for outputs at {outputs_dir}; expected global_metrics.json"
+                    )
+                else:
+                    print(
+                        f"[benchmark][info] skipped global metrics for {outputs_dir} because the test split is empty"
+                    )
+            if episodic_metrics is None and global_metrics is None:
+                if nonempty:
+                    available = ", ".join(sorted(str(p.name) for p in outputs_dir.glob("*.json")))
+                    raise FileNotFoundError(
+                        f"No usable metrics found for outputs at {outputs_dir}."
+                        + (f" Available JSON files: {available}" if available else "")
+                    )
+                else:
+                    # Empty folds are valid; we retain metadata without metrics.
+                    pass
 
             # Counts by cluster assignment
             fold_clusters = list(folds_info["folds"].get(str(fi+1), []))
@@ -270,6 +327,12 @@ def main() -> None:
                     "multiEC_ratio": multiec_ratio(Path(run_cfg["paths"]["splits_dir"]) / "test.jsonl"),
                 },
             }
+            metrics_payload: Dict[str, Any] = {}
+            if episodic_metrics is not None:
+                metrics_payload["episodic"] = episodic_metrics
+            if global_metrics is not None:
+                metrics_payload["global"] = global_metrics
+
             now = datetime.utcnow().isoformat() + "Z"
             enriched = {
                 "run_id": f"id{pct}_fold{fi+1}_{base_cfg.get('random_seed', 42)}",
@@ -284,45 +347,89 @@ def main() -> None:
                 "clustering_method": folds_info.get("clustering_method"),
                 "random_seed": int(base_cfg.get("random_seed", 42)),
                 "label_stats": label_stats,
-                "metrics": raw_metrics,
+                "metrics": metrics_payload,
+                "modes": {
+                    "episodic": episodic_metrics is not None,
+                    "global": global_metrics is not None,
+                },
                 "timestamp": now,
             }
             with open(metrics_path, "w", encoding="utf-8") as f:
                 json.dump(enriched, f, indent=2)
             per_fold_metrics.append(enriched)
 
-        # Aggregate over folds per K within the nested metrics
-        # Collect all K keys
-        K_keys = set()
-        for rec in per_fold_metrics:
-            K_keys.update(rec.get("metrics", {}).keys())
-        agg: Dict[str, Dict[str, float]] = {}
-        for Kk in sorted(K_keys):
-            # Collect metric names
-            mnames = set()
-            for rec in per_fold_metrics:
-                md = rec.get("metrics", {}).get(Kk, {})
-                for mk in md.keys():
-                    mnames.add(mk)
-            agg[Kk] = {}
-            for mkey in sorted(mnames):
-                vals = [rec.get("metrics", {}).get(Kk, {}).get(mkey) for rec in per_fold_metrics]
-                vals = [v for v in vals if v is not None]
+        agg: Dict[str, Any] = {}
+
+        episodic_records = [rec.get("metrics", {}).get("episodic") for rec in per_fold_metrics if rec.get("metrics", {}).get("episodic")]
+        global_records = [rec.get("metrics", {}).get("global") for rec in per_fold_metrics if rec.get("metrics", {}).get("global")]
+
+        if episodic_records:
+            K_keys = sorted({key for rec in episodic_records for key in rec.keys()})
+            epi_agg: Dict[str, Dict[str, float]] = {}
+            for Kk in K_keys:
+                mnames = set()
+                for rec in episodic_records:
+                    md = rec.get(Kk, {})
+                    if isinstance(md, dict):
+                        mnames.update(md.keys())
+                epi_agg[Kk] = {}
+                for mkey in sorted(mnames):
+                    vals = []
+                    for rec in episodic_records:
+                        md = rec.get(Kk, {})
+                        if isinstance(md, dict) and mkey in md and md[mkey] is not None:
+                            vals.append(float(md[mkey]))
+                    if not vals:
+                        continue
+                    mean = float(np.mean(vals))
+                    std = float(np.std(vals, ddof=1) if len(vals) > 1 else 0.0)
+                    se = std / np.sqrt(len(vals)) if vals else 0.0
+                    ci95 = 1.96 * se
+                    epi_agg[Kk][f"mean_{mkey}"] = mean
+                    epi_agg[Kk][f"std_{mkey}"] = std
+                    epi_agg[Kk][f"ci95_{mkey}"] = float(ci95)
+            agg["episodic"] = epi_agg
+
+        if global_records:
+            metric_names = sorted({mk for rec in global_records for mk in rec.keys()})
+            glob_agg: Dict[str, Dict[str, float]] = {}
+            for mkey in metric_names:
+                vals = [rec[mkey] for rec in global_records if isinstance(rec, dict) and mkey in rec and isinstance(rec[mkey], (int, float))]
                 if not vals:
                     continue
                 vals = [float(v) for v in vals]
                 mean = float(np.mean(vals))
                 std = float(np.std(vals, ddof=1) if len(vals) > 1 else 0.0)
-                se = std / np.sqrt(max(len(vals), 1)) if len(vals) > 0 else 0.0
+                se = std / np.sqrt(len(vals)) if vals else 0.0
                 ci95 = 1.96 * se
-                agg[Kk][f"mean_{mkey}"] = mean
-                agg[Kk][f"std_{mkey}"] = std
-                agg[Kk][f"ci95_{mkey}"] = float(ci95)
-        # Write per-threshold aggregate
+                glob_agg[mkey] = {
+                    "mean": mean,
+                    "std": std,
+                    "ci95": float(ci95),
+                }
+            agg["global"] = glob_agg
+
         agg_path = split_dir / "aggregate.json"
         with open(agg_path, "w", encoding="utf-8") as f:
-            json.dump({"id_threshold": pct, "aggregate": agg}, f, indent=2)
-        summary[str(pct)] = {"aggregate": agg}
+            json.dump(
+                {
+                    "id_threshold": pct,
+                    "aggregate": agg,
+                    "modes": {
+                        "episodic": bool(episodic_records),
+                        "global": bool(global_records),
+                    },
+                },
+                f,
+                indent=2,
+            )
+        summary[str(pct)] = {
+            "aggregate": agg,
+            "modes": {
+                "episodic": bool(episodic_records),
+                "global": bool(global_records),
+            },
+        }
 
     # Write summary across thresholds
     bench_path = results_root / "summary_by_id_threshold.json"

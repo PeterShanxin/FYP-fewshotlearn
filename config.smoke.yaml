@@ -44,17 +44,7 @@ multi_label: true
 hierarchy_levels: 1
 hierarchy_weight: 0.2
 allow_multi_ec: true
-
-cascade:
-  enabled: false
-
 tau_multi: 0.60
-
-detector:
-  enabled: false
-  loss_weight: 0.10
-  thresh: 0.50
-  hidden_dim: 32
 
 sampler:
   identity_disjoint: true

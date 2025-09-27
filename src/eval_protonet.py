@@ -7,7 +7,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Dict, List
 
 import numpy as np
 import torch
@@ -40,9 +40,8 @@ def eval_for_K(
     Q: int,
     episodes: int,
     show_progress: bool = True,
-    cascade_cfg: Dict[str, Any] | None = None,
-    detector_cfg: Dict[str, Any] | None = None,
     tau_multi: float = 0.6,
+    per_ec_thresholds: Dict[str, float] | None = None,
 ) -> Dict[str, float]:
     ys, yh = [], []  # single-label
     multi_label_mode = False
@@ -51,16 +50,8 @@ def eval_for_K(
     # For multi-label thresholded metrics
     y_true_ml: List[np.ndarray] = []
     y_pred_ml: List[np.ndarray] = []
-    # Track detector routing decisions when cascade is enabled
-    route_flags_all: List[int] = []  # 1 if routed to multi-branch, else 0
-    cascade_cfg = cascade_cfg or {}
-    detector_cfg = detector_cfg or {}
-    cascade_enabled = bool(cascade_cfg.get("enabled", False))
-    detector_enabled = bool(detector_cfg.get("enabled", False)) and model.detector_enabled
-    det_thresh = float(detector_cfg.get("thresh", 0.5))
     tau_multi = float(tau_multi)
-    multi_branch = 0
-    single_branch = 0
+    thresholds_map = per_ec_thresholds or {}
     with torch.no_grad():
         for _ in trange(
             episodes,
@@ -68,7 +59,7 @@ def eval_for_K(
             dynamic_ncols=True,
             disable=not show_progress,
         ):
-            sx, sy, qx, qy, _classes = sampler.sample_episode(M, K, Q)
+            sx, sy, qx, qy, classes = sampler.sample_episode(M, K, Q)
             logits, _ = model(sx, sy, qx, None)
             sm = torch.softmax(logits, dim=-1)
             pred = sm.argmax(dim=-1)
@@ -80,47 +71,25 @@ def eval_for_K(
                 total += int(qy.shape[0])
                 # Thresholded multi-label predictions for PR/F1
                 sg = torch.sigmoid(logits)
-                if cascade_enabled and detector_enabled:
-                    det_logits = model.detect_multi(logits)
-                    if det_logits is None:
-                        raise RuntimeError("Detector enabled in config but missing on model.")
-                    det_scores = torch.sigmoid(det_logits).squeeze(-1)
-                    preds = []
-                    flags = []
-                    for i in range(logits.shape[0]):
-                        if det_scores[i] >= det_thresh:
-                            row = (sg[i] >= tau_multi).float()
-                            if row.sum().item() == 0:
-                                top_idx = pred[i].item()
-                                row = torch.zeros_like(sg[i])
-                                row[top_idx] = 1.0
-                            flags.append(1)
-                        else:
-                            top_idx = pred[i].item()
-                            row = torch.zeros_like(sg[i])
-                            row[top_idx] = 1.0
-                            flags.append(0)
-                        preds.append(row)
-                    stacked = torch.stack(preds, dim=0)
-                    y_pred_ml.append(stacked.cpu().numpy())
-                    sum_flags = int(sum(flags))
-                    multi_branch += sum_flags
-                    single_branch += len(flags) - sum_flags
-                    route_flags_all.extend(flags)
-                else:
-                    y_pred_ml.append((sg >= 0.5).float().cpu().numpy())
+                tau_vec = torch.full((sg.shape[-1],), tau_multi, device=sg.device, dtype=sg.dtype)
+                if thresholds_map:
+                    for j, ec in enumerate(classes):
+                        if ec in thresholds_map:
+                            tau_vec[j] = float(thresholds_map[ec])
+                thresh_matrix = tau_vec.unsqueeze(0).expand_as(sg)
+                preds = (sg >= thresh_matrix).float()
+                zero_mask = preds.sum(dim=1) == 0
+                if zero_mask.any():
+                    rows = torch.where(zero_mask)[0]
+                    preds[rows] = 0.0
+                    top_indices = pred[rows]
+                    preds[rows, top_indices] = 1.0
+                y_pred_ml.append(preds.cpu().numpy())
                 y_true_ml.append(qy.float().cpu().numpy())
             else:
                 ys.extend(qy.cpu().numpy().tolist())
                 yh.extend(pred.cpu().numpy().tolist())
     if multi_label_mode:
-        total_branch = multi_branch + single_branch
-        if cascade_enabled and detector_enabled and total_branch > 0:
-            pct_multi = 100.0 * multi_branch / total_branch
-            print(
-                f"[eval][gate] pct_multi={pct_multi:.1f}% ({multi_branch}/{total_branch}) | "
-                f"det_thresh={det_thresh:.2f} tau_multi={tau_multi:.2f}"
-            )
         acc = float(hits / max(total, 1))
         Yt = np.vstack(y_true_ml) if y_true_ml else np.zeros((0, 0), dtype=np.float32)
         Yp = np.vstack(y_pred_ml) if y_pred_ml else np.zeros((0, 0), dtype=np.float32)
@@ -147,27 +116,6 @@ def eval_for_K(
             card_true = Yt.sum(axis=1)
             card_pred = Yp.sum(axis=1)
             true_is_multi = card_true > 1.0
-            # If routing flags exist (cascade enabled), use them to define predicted-multi; else infer from card_pred
-            if cascade_enabled and detector_enabled and len(route_flags_all) == Yt.shape[0]:
-                pred_is_multi = np.array(route_flags_all, dtype=bool)
-            else:
-                pred_is_multi = card_pred > 1.0
-            # Multi-EC detection metrics
-            tp = float(np.logical_and(true_is_multi, pred_is_multi).sum())
-            fp = float(np.logical_and(~true_is_multi, pred_is_multi).sum())
-            fn = float(np.logical_and(true_is_multi, ~pred_is_multi).sum())
-            det_prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-            det_rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-            det_f1 = 2 * det_prec * det_rec / (det_prec + det_rec) if (det_prec + det_rec) > 0 else 0.0
-            metrics.update(
-                {
-                    "det_true_multi_rate": float(true_is_multi.mean()),
-                    "det_pred_multi_rate": float(np.mean(pred_is_multi.astype(float))),
-                    "det_precision": float(det_prec),
-                    "det_recall": float(det_rec),
-                    "det_f1": float(det_f1),
-                }
-            )
             # Subset accuracy (exact set) and Jaccard
             inter = np.logical_and(Yt > 0.5, Yp > 0.5).sum(axis=1).astype(float)
             union = np.logical_or(Yt > 0.5, Yp > 0.5).sum(axis=1).astype(float)
@@ -269,17 +217,51 @@ def main() -> None:
         fallback_scope=fallback_scope,
         rare_class_boost="none",
     )
-    detector_cfg = cfg.get("detector", {}) or {}
-    cascade_cfg = cfg.get("cascade", {}) or {}
-    tau_multi = float(cfg.get("tau_multi", 0.6))
-    detector_enabled = bool(detector_cfg.get("enabled", False))
-    detector_hidden = int(detector_cfg.get("hidden_dim", 32))
+    tau_eval_cfg = eval_cfg.get("tau_multi")
+    tau_root_cfg = cfg.get("tau_multi")
+    if tau_eval_cfg is not None:
+        tau_multi = float(tau_eval_cfg)
+    elif tau_root_cfg is not None:
+        tau_multi = float(tau_root_cfg)
+    else:
+        tau_multi = 0.6
+
+    calibration_path_raw = eval_cfg.get("calibration_path")
+    if calibration_path_raw:
+        calibration_path = Path(calibration_path_raw)
+        if calibration_path.exists():
+            try:
+                with open(calibration_path, "r", encoding="utf-8") as handle:
+                    calibration_data = json.load(handle)
+            except json.JSONDecodeError as exc:
+                print(f"[eval] Warning: failed to parse calibration file {calibration_path}: {exc}")
+            else:
+                cal_tau = calibration_data.get("tau_multi")
+                if cal_tau is not None:
+                    tau_multi = float(cal_tau)
+
+    thresholds_path_raw = eval_cfg.get("per_ec_thresholds_path")
+    per_ec_thresholds: Dict[str, float] | None = None
+    if thresholds_path_raw:
+        thresholds_path = Path(thresholds_path_raw)
+        if thresholds_path.exists():
+            try:
+                with open(thresholds_path, "r", encoding="utf-8") as handle:
+                    thresholds_data = json.load(handle)
+            except json.JSONDecodeError as exc:
+                print(f"[eval] Warning: failed to parse per-EC thresholds {thresholds_path}: {exc}")
+            else:
+                if isinstance(thresholds_data, dict):
+                    per_ec_thresholds = {
+                        str(ec): float(value) for ec, value in thresholds_data.items()
+                    }
+        else:
+            print(f"[eval] Warning: per-EC thresholds file not found at {thresholds_path}")
+
     pcfg = ProtoConfig(
         input_dim=test_sampler.dim,
         projection_dim=int(cfg.get("projection_dim", 256)),
         temperature=float(cfg.get("temperature", 10.0)),
-        detector_enabled=detector_enabled,
-        detector_hidden=detector_hidden,
     )
     model = ProtoNet(pcfg).to(device)
     if requested_gpus > 1 and device.type == "cuda":
@@ -334,9 +316,8 @@ def main() -> None:
             Q,
             n_eval,
             show_progress=show_progress,
-            cascade_cfg=cascade_cfg,
-            detector_cfg=detector_cfg,
             tau_multi=tau_multi,
+            per_ec_thresholds=per_ec_thresholds,
         )
         results[f"K={K}"] = metrics
         print(f"[eval] {metrics}")

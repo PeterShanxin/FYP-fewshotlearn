@@ -263,17 +263,11 @@ def main() -> None:
     except Exception:
         has_val = False
 
-    detector_cfg = cfg.get("detector", {}) or {}
-    detector_enabled = bool(detector_cfg.get("enabled", False))
-    detector_hidden = int(detector_cfg.get("hidden_dim", 32))
-    detector_loss_weight = float(detector_cfg.get("loss_weight", 0.0))
     # Model
     pcfg = ProtoConfig(
         input_dim=train_sampler.dim,
         projection_dim=int(cfg.get("projection_dim", 256)),
         temperature=float(cfg.get("temperature", 10.0)),
-        detector_enabled=detector_enabled,
-        detector_hidden=detector_hidden,
     )
     model = ProtoNet(pcfg).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
@@ -291,8 +285,6 @@ def main() -> None:
         scaler = grad_scaler_cls(device_type=device.type, enabled=use_amp)
     except TypeError:
         scaler = grad_scaler_cls(enabled=use_amp)
-    det_loss_fn = torch.nn.BCEWithLogitsLoss() if detector_enabled else None
-
     n_train = int(cfg["episodes"]["train"])
     n_val_eval = max(1, int(cfg["episodes"]["val"]))
     # Validation cadence and size knobs
@@ -323,8 +315,6 @@ def main() -> None:
         "rare_class_boost": rare_class_boost,
         "fallback_scope": fallback_scope,
         "has_val": has_val,
-        "detector_enabled": detector_enabled,
-        "detector_loss_weight": detector_loss_weight,
     }, indent=2))
     if requested_gpus > 1 and device.type == "cuda":
         print("[train] Note: training runs on a single GPU; multi-GPU is used for embeddings only.")
@@ -344,17 +334,6 @@ def main() -> None:
         if use_amp:
             with torch.cuda.amp.autocast(dtype=torch.float16):
                 logits, loss = model(sx, sy, qx, qy)
-                if (
-                    detector_enabled
-                    and det_loss_fn is not None
-                    and multi_label
-                    and qy.dim() == 2
-                ):
-                    det_logits = model.detect_multi(logits)
-                    if det_logits is not None:
-                        y_multi = (qy.sum(dim=1) > 1).float().to(det_logits.dtype)
-                        det_loss = det_loss_fn(det_logits.squeeze(-1), y_multi)
-                        loss = loss + detector_loss_weight * det_loss
                 s = model.embed(sx)
                 q = model.embed(qx)
                 loss = loss + _apply_hierarchy_loss(model, s, q, sy, qy, classes, cfg, multi_label)
@@ -364,17 +343,6 @@ def main() -> None:
             scaler.update()
         else:
             logits, loss = model(sx, sy, qx, qy)
-            if (
-                detector_enabled
-                and det_loss_fn is not None
-                and multi_label
-                and qy.dim() == 2
-            ):
-                det_logits = model.detect_multi(logits)
-                if det_logits is not None:
-                    y_multi = (qy.sum(dim=1) > 1).float().to(det_logits.dtype)
-                    det_loss = det_loss_fn(det_logits.squeeze(-1), y_multi)
-                    loss = loss + detector_loss_weight * det_loss
             s = model.embed(sx)
             q = model.embed(qx)
             loss = loss + _apply_hierarchy_loss(model, s, q, sy, qy, classes, cfg, multi_label)

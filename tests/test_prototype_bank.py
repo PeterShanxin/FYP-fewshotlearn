@@ -23,7 +23,7 @@ def _write_split(path: Path, entries: list[dict[str, object]]) -> None:
 
 
 def _identity_model(dim: int) -> ProtoNet:
-    cfg = ProtoConfig(input_dim=dim, projection_dim=dim, temperature=1.0, detector_enabled=False)
+    cfg = ProtoConfig(input_dim=dim, projection_dim=dim, temperature=1.0)
     model = ProtoNet(cfg)
     with torch.no_grad():
         model.proj.weight.copy_(torch.eye(dim))
@@ -74,4 +74,3 @@ def test_build_prototypes_handles_multi_ec(tmp_path: Path) -> None:
     )
     assert prototypes_multi["A"].shape == (2, 2)
     assert prototypes_multi["B"].shape == (2, 2)
-

@@ -56,7 +56,6 @@ def test_global_eval_thresholds(tmp_path: Path) -> None:
         },
         "projection_dim": 2,
         "temperature": 1.0,
-        "detector": {"enabled": False, "hidden_dim": 32},
         "eval": {
             "mode": "global_support",
             "shortlist_topN": 0,
@@ -145,7 +144,6 @@ def test_global_eval_handles_zero_queries(tmp_path: Path) -> None:
         },
         "projection_dim": 2,
         "temperature": 1.0,
-        "detector": {"enabled": False, "hidden_dim": 32},
         "eval": {
             "mode": "global_support",
             "shortlist_topN": 0,

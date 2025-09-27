@@ -35,13 +35,10 @@ def infer_input_dim(embeddings_path: Path) -> int:
 
 
 def build_model(cfg: Dict[str, Any], input_dim: int, device: torch.device) -> ProtoNet:
-    detector_cfg = cfg.get("detector", {}) or {}
     model_cfg = ProtoConfig(
         input_dim=input_dim,
         projection_dim=int(cfg.get("projection_dim", 256)),
         temperature=float(cfg.get("temperature", 10.0)),
-        detector_enabled=bool(detector_cfg.get("enabled", False)),
-        detector_hidden=int(detector_cfg.get("hidden_dim", 32)),
     )
     return ProtoNet(model_cfg).to(device)
 
@@ -52,4 +49,3 @@ def load_checkpoint(model: ProtoNet, ckpt_path: Path, device: torch.device) -> N
     state = torch.load(ckpt_path, map_location=device, weights_only=True)
     model.load_state_dict(state["model"], strict=False)  # type: ignore[index]
     model.eval()
-

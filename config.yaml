@@ -56,17 +56,7 @@ episodes_per_val_check: 200  # 200-episode validation slices (faster interim CIs
 multi_label: true             # allow sequences with multiple ECs; uses BCE loss on queries
 hierarchy_levels: 2           # add auxiliary losses on EC levels (1..N), 0=off
 hierarchy_weight: 0.2         # total weight for auxiliary hierarchical losses
-
-cascade:
-  enabled: true              # if true, enable detector gating during evaluation
-
-tau_multi: 0.40               # sigmoid threshold for multi-label emission when gated
-
-detector:
-  enabled: true              # if true, train the multi-EC detector and gate predictions
-  loss_weight: 0.10           # BCE loss weight for detector head (added to main loss)
-  thresh: 0.20                # sigmoid threshold on detector output to trigger multi-branch
-  hidden_dim: 32              # detector MLP hidden size
+tau_multi: 0.40               # base sigmoid threshold for multi-label emission
 
 sampler:
   identity_disjoint: true
@@ -87,12 +77,13 @@ eval:
 
 # Identity clustering (pipeline-generated)
 cluster_identity: 0.5         # sequence identity threshold for clustering
-cluster_coverage: 0.5         # minimum coverage fraction for MMseqs2 clustering
+cluster_coverage: 0.7         # minimum coverage fraction for MMseqs2 clustering
+identity_cluster_backend: linclust  # use MMseqs linclust backend for identity components
 
 # Identity benchmark (multi-threshold CV)
-# id_thresholds: [10, 30, 50, 70, 100]
+id_thresholds: [30, 50, 70, 100]
 # folds: 5 # CLEAN group's set-up
-id_thresholds: [50]
+# id_thresholds: [50]
 folds: 5
 identity_definition: tool_default      # global_pairwise | local_pairwise | tool_default
 clustering_method: existing_id_cluster_module

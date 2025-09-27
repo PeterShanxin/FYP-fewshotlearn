@@ -136,6 +136,74 @@ def mmseqs_pairwise_edges(
 
 # CD-HIT support removed for simplicity; MMseqs2 or Python fallback only.
 
+
+def mmseqs_cluster_components(
+    fasta: Path,
+    workdir: Path,
+    min_id: float,
+    min_cov: float,
+    threads: int | None = None,
+    mode: str = "linclust",
+) -> List[List[str]]:
+    """Cluster sequences with MMseqs2 and return per-cluster accession lists."""
+
+    workdir.mkdir(parents=True, exist_ok=True)
+    threads = detect_allocated_cpus(threads)
+    threads_str = str(threads)
+    logs = workdir / "logs"
+
+    db_name = "seqdb"
+    clu_name = f"seqclu_{mode}"
+    tmp_name = f"tmp_{mode}"
+    tsv_name = f"clusters_{mode}.tsv"
+
+    run_quiet(
+        ["mmseqs", "createdb", str(fasta.name), db_name],
+        cwd=workdir,
+        log_file=logs / "mmseqs_createdb.log",
+    )
+
+    cluster_cmd = [
+        "mmseqs",
+        mode,
+        db_name,
+        clu_name,
+        tmp_name,
+        "--min-seq-id",
+        str(min_id),
+        "-c",
+        str(min_cov),
+        "--cov-mode",
+        "1",
+        "--threads",
+        threads_str,
+        "--remove-tmp-files",
+        "1",
+    ]
+
+    run_quiet(cluster_cmd, cwd=workdir, log_file=logs / f"mmseqs_{mode}.log")
+    run_quiet(
+        ["mmseqs", "createtsv", db_name, db_name, clu_name, tsv_name],
+        cwd=workdir,
+        log_file=logs / f"mmseqs_createtsv_{mode}.log",
+    )
+
+    clusters: DefaultDict[str, Set[str]] = defaultdict(set)
+    tsv_path = workdir / tsv_name
+    with open(tsv_path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 2:
+                continue
+            rep, member = parts[0], parts[1]
+            clusters[rep].add(rep)
+            clusters[rep].add(member)
+
+    return [sorted(list(members)) for rep, members in sorted(clusters.items(), key=lambda kv: kv[0])]
+
+
+# CD-HIT support removed for simplicity; MMseqs2 or Python fallback only.
+
 def python_pairwise_edges(pairs: List[Tuple[str, str]], min_ratio: float) -> List[Tuple[str, str]]:
     """Very slow O(N^2) approximate edge builder using difflib ratio.
 
@@ -300,8 +368,12 @@ def main() -> None:
     # Sequence pairs for clustering/components
     acc2seq = {str(r["accession"]): str(r["sequence"]).upper() for _, r in df.iterrows() if pd.notna(r["sequence"]) }
     pairs = sorted(acc2seq.items())
+    nodes = [a for a, _ in pairs]
     # Build EC -> list[acc]
     by_ec_all = group_by_ec(df)
+
+    backend_pref_raw = cfg.get("identity_cluster_backend", "easy_search")
+    backend_pref = str(backend_pref_raw).strip().lower() if backend_pref_raw is not None else "easy_search"
 
     # Identity cutoffs (allow config override: percentages)
     cfg_thresholds = cfg.get("id_thresholds")
@@ -317,13 +389,13 @@ def main() -> None:
     for cut in cuts:
         pct = int(round(cut * 100))
         print(f"[id-split] cutoff={pct}% | building identity graph → components…")
-        # Compute pairwise edges (fast path: MMseqs2; fallback: Python)
+        # Compute components (fast path: MMseqs2; fallback: Python)
         work = Path(f"data/identity/_work_id{pct}")
         work.mkdir(parents=True, exist_ok=True)
         fasta = work / "all.fasta"
         write_fasta(pairs, fasta)
         mmseqs_ok = shutil.which("mmseqs") is not None and identity_definition in ("tool_default",)
-        edges: List[Tuple[str, str]]
+        comps: List[List[str]]
         if mmseqs_ok:
             cov = float(cfg.get('cluster_coverage', 0.5))
             # Optional override via config: mmseqs_threads
@@ -333,19 +405,38 @@ def main() -> None:
             except Exception:
                 cfg_thr_i = None
             thr_used = detect_allocated_cpus(cfg_thr_i)
-            print(f"[id-split][mmseqs] easy-search min_id={cut} cov>={cov} threads={thr_used} (quiet; logs at {work/'logs/mmseqs_easy_search.log'})")
-            edges = mmseqs_pairwise_edges(fasta, work, min_id=cut, min_cov=cov, threads=thr_used)
-            clustering_method = "mmseqs_easy_search"
-            identity_def_used = "tool_default"
+            backend = backend_pref if backend_pref in {"linclust", "cluster", "easy_search", "edges", "edge"} else "easy_search"
+            if backend in {"linclust", "cluster"}:
+                mmseqs_mode = "linclust" if backend == "linclust" else "cluster"
+                print(
+                    f"[id-split][mmseqs] {mmseqs_mode} min_id={cut} cov>={cov} threads={thr_used} "
+                    f"(quiet; logs under {work/'logs'})"
+                )
+                comps = mmseqs_cluster_components(
+                    fasta,
+                    work,
+                    min_id=cut,
+                    min_cov=cov,
+                    threads=thr_used,
+                    mode=mmseqs_mode,
+                )
+                clustering_method = f"mmseqs_{mmseqs_mode}"
+                identity_def_used = "tool_default"
+            else:
+                print(
+                    f"[id-split][mmseqs] easy-search min_id={cut} cov>={cov} threads={thr_used} "
+                    f"(quiet; logs at {work/'logs/mmseqs_easy_search.log'})"
+                )
+                edges = mmseqs_pairwise_edges(fasta, work, min_id=cut, min_cov=cov, threads=thr_used)
+                comps = connected_components(nodes, edges)
+                clustering_method = "mmseqs_easy_search"
+                identity_def_used = "tool_default"
         else:
             print("[id-split][warn] MMseqs2 not found; using Python approximate pairwise identity (slow, approximate)")
             edges = python_pairwise_edges(pairs, min_ratio=cut)
+            comps = connected_components(nodes, edges)
             clustering_method = "python_difflib_ratio"
             identity_def_used = "global_pairwise"
-
-        # Connected components define clusters at this threshold
-        nodes = [a for a, _ in pairs]
-        comps = connected_components(nodes, edges)
         print(f"[id-split] components built: {len(comps)} clusters at {pct}%")
         clu2acc: Dict[str, List[str]] = {}
         for comp in comps:

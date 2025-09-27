@@ -79,15 +79,11 @@ Construct a global prototype bank from the training split and evaluate queries a
 
 3. **(Optional) Tune thresholds on a dev split**
    ```bash
-   python scripts/tune_tau.py --config config.yaml --protos artifacts/prototypes.npz --split val --out artifacts/calibration.json
+   python scripts/tune_tau.py --config config.yaml --protos artifacts/prototypes.npz --split val \
+     --tau-min 0.2 --tau-max 0.6 --tau-step 0.02 --metric micro_f1 \
+     --out artifacts/calibration.json --per-class-out artifacts/per_ec_thresholds.json
    ```
-   The generated `calibration.json` is auto-consumed by `scripts/eval_global.py` (and `src.eval_protonet --mode global_support`) unless overridden on the CLI.
-
-## Multi-EC Detector Cascade (optional)
-- Enable the detector head during training with `detector.enabled: true`. Its BCE loss is weighted by `detector.loss_weight` and the head uses a single hidden layer of size `detector.hidden_dim`.
-- Turn on gating at evaluation time by setting `cascade.enabled: true`. The detector's sigmoid score is compared against `detector.thresh`; when it wins, query logits are thresholded with `tau_multi` to emit multiple ECs (with an argmax fallback if none exceed the threshold). Otherwise the evaluation sticks to the single top-1 label.
-- When either flag is left `false`, the training/eval behaviour matches the previous release exactly. Evaluation prints a short summary with the percent of queries routed to the multi-label branch for quick sanity checks.
-- To tune thresholds on validation data, point the config at your validation split (e.g., lower `episodes.eval` or repoint it to the val JSONL), set `detector.enabled=true` and `cascade.enabled=true`, then re-run `python -m src.eval_protonet` while sweeping `detector.thresh` and `tau_multi`. A short shell/Python loop that edits those two keys between runs works well for quick grids.
+   The resulting global `tau_multi` (in `calibration.json`) and optional per-EC overrides are consumed by both episodic (`src.eval_protonet`) and global-support evaluation. A top-1 fallback keeps at least one EC label whenever thresholds suppress every score.
 
 ### One‑liners
 
@@ -169,7 +165,7 @@ See `config.yaml` for all knobs. Key defaults:
 - Multi-EC: `allow_multi_ec=true` (expand multi-EC rows)
 - Identity-aware episodes: `identity_disjoint=true` with clusters from `paths.clusters_tsv`
 - EC hierarchy: `hierarchy_levels=2`, `hierarchy_weight=0.2`
-- Detector cascade (all off by default): `cascade.enabled=false`, `tau_multi=0.60`, `detector.enabled=false`, `detector.loss_weight=0.10`, `detector.thresh=0.50`, `detector.hidden_dim=32`
+- Multi-label thresholds: `tau_multi=0.60` (fallback) with tuned values loaded from `artifacts/calibration.json` and optional per-EC overrides from `artifacts/per_ec_thresholds.json`
 - Random seed: `42`
 
 Paths (relative):
@@ -184,7 +180,7 @@ Paths (relative):
 
 ---
 
-## HPC Profile (A40 48GB)
+## HPC Profile (A40 48GB) - note
 - Use `config.yaml` to leverage a single NVIDIA A40 (48GB) and a multi-core CPU.
 - Key changes vs. default:
   - ESM model: `esm2_t33_650M_UR50D` (larger, better quality)
@@ -242,7 +238,7 @@ Goal: enforce that no test sequence shares more than X% identity with any traini
 - Config-driven run (recommended): set a list of thresholds in `config.yaml` and run the pipeline.
   ```yaml
   # config.yaml
-  id_thresholds: [10, 30, 50, 70, 100]
+  id_thresholds: [30, 50, 70, 100]
   folds: 5
   ```
   ```bash

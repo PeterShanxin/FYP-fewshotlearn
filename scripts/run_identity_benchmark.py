@@ -15,7 +15,7 @@ import os
 import subprocess
 from copy import deepcopy
 from pathlib import Path
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional
 
 import yaml
 import numpy as np
@@ -201,8 +201,48 @@ def main() -> None:
                     )
                 )
 
+            episodic_skip_reason: Optional[str] = None
+            episodic_skipped = False
+            eligible_classes = 0
+            required_classes = None
+            need_per_class = None
+
+            if run_episodic:
+                episode_cfg = run_cfg.get("episode", {}) or {}
+                M_eval = int(episode_cfg.get("M_val", episode_cfg.get("M_train", 5)))
+                K_eval = int(episode_cfg.get("K_val", episode_cfg.get("K_train", 1)))
+                Q_eval = int(episode_cfg.get("Q_val", episode_cfg.get("Q_train", 1)))
+                required_classes = M_eval
+                need_per_class = K_eval + Q_eval
+                if test_jsonl.exists():
+                    with open(test_jsonl, "r", encoding="utf-8") as f:
+                        for line in f:
+                            try:
+                                obj = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            accs = obj.get("accessions", [])
+                            if isinstance(accs, list) and len(accs) >= need_per_class:
+                                eligible_classes += 1
+                if eligible_classes < M_eval:
+                    episodic_skip_reason = (
+                        f"insufficient eligible classes (have {eligible_classes}, need at least {M_eval}) "
+                        f"for K={K_eval}, Q={Q_eval} (≥{need_per_class} embeddings per class)"
+                    )
+
             if nonempty:
                 for label, cmd in eval_commands:
+                    if label == "episodic" and episodic_skip_reason is not None:
+                        episodic_skipped = True
+                        print(
+                            f"[benchmark][skip] mode=episodic cutoff={pct} fold={fi+1}: {episodic_skip_reason}"
+                        )
+                        if metrics_path.exists():
+                            try:
+                                metrics_path.unlink()
+                            except OSError:
+                                pass
+                        continue
                     print(f"[benchmark][eval] mode={label} cutoff={pct} fold={fi+1}")
                     run(cmd)
             else:
@@ -250,7 +290,11 @@ def main() -> None:
                         global_metrics = gm
 
             if run_episodic and episodic_metrics is None:
-                if nonempty:
+                if episodic_skipped:
+                    print(
+                        f"[benchmark][info] skipped episodic metrics for {outputs_dir}: {episodic_skip_reason}"
+                    )
+                elif nonempty:
                     print(
                         f"[benchmark][warn] episodic metrics missing for outputs at {outputs_dir}; expected metrics.json"
                     )
@@ -330,6 +374,14 @@ def main() -> None:
             metrics_payload: Dict[str, Any] = {}
             if episodic_metrics is not None:
                 metrics_payload["episodic"] = episodic_metrics
+            elif episodic_skipped:
+                skip_meta: Dict[str, Any] = {"reason": episodic_skip_reason or "insufficient data"}
+                if required_classes is not None:
+                    skip_meta["required_classes"] = int(required_classes)
+                if need_per_class is not None:
+                    skip_meta["min_examples_per_class"] = int(need_per_class)
+                skip_meta["eligible_classes"] = int(eligible_classes)
+                metrics_payload["episodic_skipped"] = skip_meta
             if global_metrics is not None:
                 metrics_payload["global"] = global_metrics
 

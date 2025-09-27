@@ -20,23 +20,6 @@ class ProtoConfig:
     input_dim: int
     projection_dim: int = 256
     temperature: float = 10.0
-    detector_enabled: bool = False
-    detector_hidden: int = 32
-
-
-class MultiECDetector(nn.Module):
-    """Tiny MLP that predicts whether a query should emit multiple ECs."""
-
-    def __init__(self, in_features: int, hidden_dim: int) -> None:
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_features, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, 1),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
 
 
 class ProtoNet(nn.Module):
@@ -50,12 +33,6 @@ class ProtoNet(nn.Module):
             self.proj = nn.Identity()
             out_dim = cfg.input_dim
         self.out_dim = out_dim
-        self.detector_enabled = bool(cfg.detector_enabled)
-        feature_dim = 7
-        if self.detector_enabled:
-            self.detector = MultiECDetector(feature_dim, int(cfg.detector_hidden))
-        else:
-            self.detector = None
 
     @staticmethod
     def l2n(x: torch.Tensor) -> torch.Tensor:
@@ -106,26 +83,6 @@ class ProtoNet(nn.Module):
             else:
                 loss = F.cross_entropy(logits, query_y)
         return logits, loss
-
-    def features_from_logits(self, logits: torch.Tensor) -> torch.Tensor:
-        """Construct detector features from logits without altering grad flow."""
-        probs = torch.softmax(logits, dim=-1)
-        topk = probs.topk(k=min(3, probs.shape[-1]), dim=-1)
-        vals = topk.values
-        pad = torch.zeros((logits.shape[0], max(0, 3 - vals.shape[-1])), device=logits.device, dtype=logits.dtype)
-        padded = torch.cat([vals, pad], dim=-1)
-        p1, p2, p3 = padded.unbind(dim=-1)
-        margin12 = p1 - p2
-        entropy = -(probs * torch.log(probs.clamp_min(1e-8))).sum(dim=-1)
-        lmax = logits.max(dim=-1).values
-        lstd = logits.std(dim=-1, unbiased=False)
-        return torch.stack((p1, p2, p3, margin12, entropy, lmax, lstd), dim=-1)
-
-    def detect_multi(self, logits: torch.Tensor) -> Optional[torch.Tensor]:
-        if not self.detector_enabled or self.detector is None:
-            return None
-        feats = self.features_from_logits(logits)
-        return self.detector(feats)
 
     @torch.inference_mode()
     def predict(self, support_x: torch.Tensor, support_y: torch.Tensor, query_x: torch.Tensor) -> torch.Tensor:

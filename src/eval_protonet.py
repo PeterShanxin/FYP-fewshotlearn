@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import numbers
 from pathlib import Path
 from typing import Dict, List
 
@@ -55,7 +56,7 @@ def eval_for_K(
     with torch.no_grad():
         for _ in trange(
             episodes,
-            desc="[eval] episodes",
+            desc=f"[eval] episodes (M={M}, K={K}, Q={Q})",
             dynamic_ncols=True,
             disable=not show_progress,
         ):
@@ -156,6 +157,21 @@ def eval_for_K(
     r = recall_score(ys, yh, average="macro", zero_division=0)
     f1 = f1_score(ys, yh, average="macro", zero_division=0)
     return {"acc": float(acc), "macro_precision": float(p), "macro_recall": float(r), "macro_f1": float(f1)}
+
+
+def print_metrics_table(prefix: str, metrics: Dict[str, float]) -> None:
+    if not metrics:
+        print(f"{prefix} (no metrics)")
+        return
+    width = max(len(key) for key in metrics.keys())
+    print(prefix)
+    for key in sorted(metrics.keys()):
+        value = metrics[key]
+        if isinstance(value, numbers.Real):
+            formatted = f"{float(value):.4f}"
+        else:
+            formatted = str(value)
+        print(f"  {key:<{width}} : {formatted}")
 
 
 def main() -> None:
@@ -320,7 +336,7 @@ def main() -> None:
             per_ec_thresholds=per_ec_thresholds,
         )
         results[f"K={K}"] = metrics
-        print(f"[eval] {metrics}")
+        print_metrics_table(f"[eval][episodic][K={K}] metrics:", metrics)
 
     out_path = Path(paths["outputs"]) / "metrics.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)

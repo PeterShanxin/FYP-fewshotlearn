@@ -9,6 +9,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import numpy as np
 import torch
 from sklearn.metrics import f1_score, precision_score, recall_score
+from tqdm.auto import tqdm
 
 from .episodic_sampler import SplitIndex
 from .model_utils import build_model, infer_input_dim, load_checkpoint, load_cfg, pick_device
@@ -76,6 +77,7 @@ class GlobalSupportEvaluator:
         shortlist_topN: int,
         per_ec_thresholds: Optional[Dict[str, float]] = None,
         ensure_top1: bool = True,
+        show_progress: bool = True,
     ) -> None:
         self.cfg = cfg
         self.device = device
@@ -83,6 +85,7 @@ class GlobalSupportEvaluator:
         self.per_ec_thresholds = per_ec_thresholds or {}
         self.ensure_top1 = ensure_top1
         self.shortlist_topN = int(shortlist_topN)
+        self.show_progress = bool(show_progress)
 
         self.prototypes, self.train_counts = load_prototypes(prototypes_path)
         if not self.prototypes:
@@ -147,7 +150,19 @@ class GlobalSupportEvaluator:
         y_true_rows: List[List[int]] = []
         missing_embedding = 0
         missing_labels = 0
-        for acc, ecs in acc2ecs.items():
+
+        acc_iter = acc2ecs.items()
+        progress_iter = None
+        if self.show_progress:
+            progress_iter = tqdm(
+                acc_iter,
+                total=total_queries,
+                desc="[global] collecting queries",
+                dynamic_ncols=True,
+                leave=False,
+            )
+            acc_iter = progress_iter
+        for acc, ecs in acc_iter:
             if acc not in key2row:
                 missing_embedding += 1
                 continue
@@ -157,6 +172,9 @@ class GlobalSupportEvaluator:
                 continue
             rows.append(key2row[acc])
             y_true_rows.append(labels)
+
+        if progress_iter is not None:
+            progress_iter.close()
 
         covered_queries = len(rows)
         self.coverage = CoverageStats(
@@ -181,12 +199,24 @@ class GlobalSupportEvaluator:
         query_embeddings: List[torch.Tensor] = []
         batch_size = 1024
         with torch.no_grad():
-            for start in range(0, covered_queries, batch_size):
+            batch_iter = range(0, covered_queries, batch_size)
+            progress_embed = None
+            if self.show_progress:
+                progress_embed = tqdm(
+                    batch_iter,
+                    desc="[global] embedding queries",
+                    dynamic_ncols=True,
+                    leave=False,
+                )
+                batch_iter = progress_embed
+            for start in batch_iter:
                 chunk = rows[start : start + batch_size]
                 batch_np = np.stack([X[idx] for idx in chunk]).astype(np.float32)
                 tensor = torch.from_numpy(batch_np).to(self.device)
                 embedded = self.model.embed(tensor)
                 query_embeddings.append(embedded)
+            if progress_embed is not None:
+                progress_embed.close()
         Z = torch.cat(query_embeddings, dim=0)
 
         scores = Z @ proto_matrix.T  # [Q, total_proto]
@@ -333,6 +363,7 @@ def run_global_evaluation(
     cfg = load_cfg(config_path)
     device = pick_device(cfg)
     eval_cfg = cfg.get("eval", {}) or {}
+    show_progress = bool(cfg.get("progress", True))
 
     base_tau = float(eval_cfg.get("tau_multi", 0.35))
     base_temp = float(eval_cfg.get("temperature", 0.07))
@@ -360,6 +391,7 @@ def run_global_evaluation(
         shortlist_topN=shortlist,
         per_ec_thresholds=thresholds,
         ensure_top1=ensure_top1,
+        show_progress=show_progress,
     )
     return evaluator.evaluate(
         temperature=temp,

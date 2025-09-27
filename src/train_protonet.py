@@ -92,7 +92,7 @@ def episodic_accuracy(
         with evaluating(model):
             for _ in trange(
                 episodes,
-                desc="[val] episodes",
+                desc=f"[val] episodes (M={M}, K={K}, Q={Q})",
                 leave=False,
                 dynamic_ncols=True,
                 disable=not show_progress,

@@ -347,6 +347,12 @@ def main() -> None:
 
     # Load full table and expand multi-ECs if needed
     df = pd.read_csv(joined, sep="\t")
+    # Optional source filter: keep only Swiss‑Prot (or other) when using merged TSV
+    split_source = cfg.get("split_source")
+    if split_source is not None and "source" in [c.lower() for c in df.columns]:
+        # Normalize column names to lowercase for robust access
+        df.columns = [c.lower() for c in df.columns]
+        df = df[df["source"].astype(str) == str(split_source)]
     df = expand_multi(df, allow_multi_ec=allow_multi_ec)
 
     # Optional downsampling for smoke tests (mirror src.prepare_split.py behavior)

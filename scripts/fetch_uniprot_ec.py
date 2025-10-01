@@ -106,10 +106,38 @@ def _download(url: str, out_path: Path, label: str):
                 "Accept": "*/*",
             })
             with urllib.request.urlopen(req, timeout=60) as resp:
-                data = resp.read()
                 rel = resp.headers.get('X-UniProt-Release-Date', '')
-            out_path.write_bytes(data)
-            sha = hashlib.sha256(data).hexdigest()
+                # Stream to disk with a progress bar when size is known
+                total = 0
+                try:
+                    total = int(resp.headers.get('Content-Length') or 0)
+                except Exception:
+                    total = 0
+                hasher = hashlib.sha256()
+                chunk = 1024 * 1024
+                t0 = datetime.now()
+                if SHOW_PROGRESS and total > 0:
+                    from tqdm.auto import tqdm as _tq
+                    pbar = _tq(total=total, unit='B', unit_scale=True, desc=f"[fetch:{label}]", dynamic_ncols=True, leave=False)
+                else:
+                    pbar = None
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                with out_path.open('wb') as fh:
+                    while True:
+                        buf = resp.read(chunk)
+                        if not buf:
+                            break
+                        fh.write(buf)
+                        hasher.update(buf)
+                        if pbar is not None:
+                            pbar.update(len(buf))
+                if pbar is not None:
+                    pbar.close()
+                dt = (datetime.now() - t0).total_seconds() or 1e-9
+                bytes_written = out_path.stat().st_size
+                mbps = (bytes_written / 1e6) / dt
+                log(f"[fetch:{label}] wrote {bytes_written:,} bytes in {dt:.2f}s ({mbps:.2f} MB/s)")
+            sha = hasher.hexdigest()
             if attempt > 1:
                 log(f"[retry] {label} succeeded on attempt {attempt}")
             return rel, sha

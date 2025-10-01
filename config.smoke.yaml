@@ -46,6 +46,9 @@ hierarchy_weight: 0.2
 allow_multi_ec: true
 tau_multi: 0.60
 
+# Ensure splits are built from Swiss-Prot only when using a merged joined TSV
+split_source: SwissProt
+
 sampler:
   identity_disjoint: true
   with_replacement_fallback: true
@@ -88,7 +91,7 @@ limit_per_class: 3         # and at most this many accessions per class
 # Use the main fetched dataset; keep smoke outputs separate
 paths:
   data_root: data/uniprot_ec
-  joined_tsv: data/uniprot_ec/swissprot_ec_joined.tsv
+  joined_tsv: data/uniprot_ec/merged_ec_joined.tsv
   embeddings: data/emb/embeddings_smoke
   splits_dir: data/splits_smoke
   outputs: results/smoke

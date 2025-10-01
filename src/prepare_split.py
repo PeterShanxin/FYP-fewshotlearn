@@ -32,6 +32,7 @@ class Config:
     allow_multi_ec: bool = False
     limit_classes: int | None = None
     limit_per_class: int | None = None
+    split_source: str | None = None  # Optional: filter rows by 'source' column when present
 
 
 def load_config(path: str) -> Config:
@@ -46,6 +47,7 @@ def load_config(path: str) -> Config:
         allow_multi_ec=bool(cfg.get("allow_multi_ec", False)),
         limit_classes=(int(cfg.get("limit_classes")) if cfg.get("limit_classes") is not None else None),
         limit_per_class=(int(cfg.get("limit_per_class")) if cfg.get("limit_per_class") is not None else None),
+        split_source=(str(cfg.get("split_source")).strip() if cfg.get("split_source") not in (None, "", "null") else None),
     )
 
 
@@ -58,6 +60,23 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     df["ec"] = df["ec"].astype(str).str.strip()
     df["accession"] = df["accession"].astype(str)
     return df
+
+
+def apply_split_source_filter(df: pd.DataFrame, split_source: str | None) -> pd.DataFrame:
+    """Filter to a specific source if requested.
+
+    If 'source' column is present in df and split_source is provided, keep only
+    those rows. If the column is missing but split_source equals 'SwissProt', we
+    assume all rows are Swiss‑Prot and return df unchanged.
+    """
+    if split_source is None:
+        return df
+    cols = [c.lower() for c in df.columns]
+    if "source" not in cols:
+        # Treat as Swiss‑Prot only file
+        return df
+    mask = df["source"].astype(str) == str(split_source)
+    return df[mask]
 
 
 def filter_or_expand_ec(df: pd.DataFrame, allow_multi_ec: bool) -> pd.DataFrame:
@@ -156,6 +175,8 @@ def main() -> None:
         )
 
     df = pd.read_csv(cfg.joined_tsv, sep="\t")
+    # Optional source filter (when using a merged file with 'source' column)
+    df = apply_split_source_filter(df, cfg.split_source)
     df = filter_or_expand_ec(df, allow_multi_ec=cfg.allow_multi_ec)
 
     # Optional downsampling for smoke tests: keep only top-N classes and at most

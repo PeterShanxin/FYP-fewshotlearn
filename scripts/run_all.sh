@@ -33,8 +33,10 @@ LOG_DIR=""
 declare -A PHASE_STARTS=()
 CURRENT_PHASE=""
 
+# Emit timestamp in Singapore Time (SGT)
+# Include timezone abbreviation to avoid "+0800" confusion.
 timestamp() {
-  date -u +"%Y-%m-%dT%H:%M:%SZ"
+  TZ="Asia/Singapore" date +"%Y-%m-%dT%H:%M:%S %Z"
 }
 
 log_line() {
@@ -237,6 +239,19 @@ else
   bash scripts/fetch_uniprot_ec.sh
 fi
 phase_complete "fetch"
+
+# 1.5) Targeted TrEMBL top-up → merged joined TSV (SwissProt + TrEMBL)
+phase_begin "topup"
+TOPUP_STATUS="success"
+if python scripts/topup_trembl_targeted.py -c "${CFG}" --target-min auto --buffer 2 --cap-per-ec 50 --max-ecs 2000 --augment-train; then
+  echo "[run_all] Top-up merged TSV ready (SwissProt + targeted TrEMBL)"
+  log_line "phase=topup detail=topup_trembl status=success"
+else
+  echo "[run_all][warn] Top-up step failed; proceeding with Swiss‑Prot only" >&2
+  log_line "phase=topup detail=topup_trembl status=failed"
+  TOPUP_STATUS="failed"
+fi
+phase_complete "topup" "$TOPUP_STATUS"
 
 # Improve CUDA allocation behavior for large batches/models
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True

@@ -23,7 +23,7 @@ modules:
 # Episode settings (few-shot task shape)
 episode:
   M_train: 10        # training ways
-  K_train: 1         # training shots
+  K_train: 3         # training shots (increase for robustness with TrEMBL)
   Q_train: 5         # training queries per class
   M_val: 10          # validation/test ways
   K_val: 1           # validation/test shots
@@ -97,13 +97,18 @@ min_sequences_per_class_for_train: 1
 random_seed: 42
 allow_multi_ec: true
 
+# When using a merged joined TSV that includes a 'source' column, keep
+# class splits derived from Swiss‑Prot only to avoid noisy eval/val splits.
+split_source: SwissProt
+
 # Fetch
 force_fetch: false
 
 # Paths
 paths:
   data_root: data/uniprot_ec
-  joined_tsv: data/uniprot_ec/swissprot_ec_joined.tsv
+  # Use merged (Swiss‑Prot + targeted TrEMBL top‑up) by default
+  joined_tsv: data/uniprot_ec/merged_ec_joined.tsv
   embeddings: data/emb/embeddings
   splits_dir: data/splits
   outputs: results

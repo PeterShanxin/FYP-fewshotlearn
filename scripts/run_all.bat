@@ -20,9 +20,22 @@ if errorlevel 1 (
   )
 )
 
+:: 1.5) Targeted TrEMBL top-up (build merged joined TSV)
+echo [run_all] Top-up: SwissProt + targeted TrEMBL
+python scripts/topup_trembl_targeted.py --config %CFG% --target-min auto --buffer 2 --cap-per-ec 50 --max-ecs 2000
+if errorlevel 1 (
+  echo [run_all] [warn] Top-up step failed; proceeding with Swiss-Prot only
+)
+
 :: 2) Prepare splits
 python -m src.prepare_split -c %CFG%
 if errorlevel 1 goto :error
+
+:: 2.1) Augment train split now that splits exist
+python scripts/topup_trembl_targeted.py --config %CFG% --target-min auto --buffer 2 --augment-train --augment-only
+if errorlevel 1 (
+  echo [run_all] [warn] Train augmentation step failed; continuing
+)
 
 :: 2.5) Cluster sequences for identity-aware sampling
 echo [run_all] Clustering sequences for identity-aware sampling

@@ -31,9 +31,9 @@ episode:
 
 # Episode counts (raise for tighter confidence intervals)
 episodes:
-  train: 10000       # 5k–20k recommended; start with 10k
-  val: 2000          # increase validation episodes
-  eval: 5000         # meta-test episodes for tight CIs
+  train: 15000       # bump for tighter confidence intervals
+  val: 3000          # larger validation pool for checkpoint selection
+  eval: 8000         # more meta-test episodes tighten CIs further
 
 # Embedding runtime knobs (optimize throughput)
 batch_size_embed: 1536   # 2x A40 with FP16+DP; dynamic_batch adapts on OOM
@@ -49,8 +49,12 @@ temperature: 10.0
 
 # Training knobs
 fp16_train: false            # AMP for ProtoNet head (gains minimal; keep FP32)
-eval_every: 1000             # validate every 1k episodes (10 checks across 10k)
-episodes_per_val_check: 200  # 200-episode validation slices (faster interim CIs)
+eval_every: 500              # validate every 500 episodes (~30 checks across 15k)
+episodes_per_val_check: 300  # ~30k queries per interim validation slice
+patience_checks: 8           # stop after 8 flat checks
+min_delta: 0.004             # require ≥0.4pp improvement to reset patience
+save_last: true              # keep best+last checkpoints for inspection
+final_val_episodes: 1000     # final best-vs-last tiebreak on a larger slice
 
 # Multi-label and hierarchy
 multi_label: true             # allow sequences with multiple ECs; uses BCE loss on queries
@@ -62,8 +66,7 @@ sampler:
   identity_disjoint: true
   with_replacement_fallback: true          # train only, for classes with count < K+Q
   fallback_scope: train_only
-  # rare_class_boost: inverse_log_freq       # sample tail ECs more often
-  rare_class_boost: none                  # uniform sampling
+  rare_class_boost: inverse_log_freq       # sample tail ECs more often
 
 eval:
   mode: global_support                     # new mode

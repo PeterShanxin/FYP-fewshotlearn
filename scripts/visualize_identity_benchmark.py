@@ -181,6 +181,19 @@ def single_boxplot(ax, thresholds: List[int], data: Dict[int, List[float]], labe
     ax.legend([bp["boxes"][0]], [label], loc="best")
 
 
+def plot_single_bar(ax, x_label: str, mean: float, ci95: float, *, color: str, title: str, ylabel: str, ylim: tuple[float, float] | None = None):
+    # Draw a single bar with symmetric 95% CI error bar
+    xs = [x_label]
+    vals = [mean]
+    errs = [ci95]
+    ax.bar(xs, vals, yerr=errs, color=color, alpha=0.85, capsize=6)
+    ax.set_title(title)
+    ax.set_ylabel(ylabel)
+    if ylim is not None:
+        ax.set_ylim(*ylim)
+    ax.grid(True, axis="y", alpha=0.3)
+
+
 def describe_monotonic_trend(values: List[int]) -> str:
     """Describe the monotonic trend of a sequence as a short word."""
     if not values or len(values) < 2:
@@ -221,18 +234,34 @@ def main() -> None:
     from matplotlib.backends.backend_pdf import PdfPages
 
     figs: List[object] = []
+    is_multi = len(thresholds) >= 2
+    single_label = str(thresholds[0]) if thresholds else "NA"
 
     # 1) Top-1 accuracy vs threshold (K=1)
     ths, acc_vals, acc_ci = extract_metric(summary, "acc_top1_hit", "K=1")
     fig, ax = plt.subplots(figsize=(7, 4))
-    plotted = plot_line_with_ci(ax, ths, acc_vals, acc_ci, label="K=1", color="#4C78A8")
-    ax.set_title("Top-1 Accuracy vs. Identity Threshold")
-    ax.set_xlabel("Identity threshold (%)")
-    ax.set_ylabel("Accuracy (mean ± 95% CI)")
-    ax.set_ylim(0.0, 1.05)
-    ax.grid(True, alpha=0.3)
-    if plotted:
-        ax.legend()
+    if is_multi:
+        plotted = plot_line_with_ci(ax, ths, acc_vals, acc_ci, label="K=1", color="#4C78A8")
+        ax.set_title("Top-1 Accuracy vs. Identity Threshold")
+        ax.set_xlabel("Identity threshold (%)")
+        ax.set_ylabel("Accuracy (mean ± 95% CI)")
+        ax.set_ylim(0.0, 1.05)
+        ax.grid(True, alpha=0.3)
+        if plotted:
+            ax.legend()
+    else:
+        val = acc_vals[0] if acc_vals else float("nan")
+        ci = acc_ci[0] if acc_ci else 0.0
+        plot_single_bar(
+            ax,
+            x_label=f"{single_label}%",
+            mean=val,
+            ci95=ci,
+            color="#4C78A8",
+            title=f"Top-1 Accuracy @ {single_label}%",
+            ylabel="Accuracy (mean ± 95% CI)",
+            ylim=(0.0, 1.05),
+        )
     fig.tight_layout()
     fig.savefig(out_dir / "accuracy_vs_threshold.png", dpi=args.dpi)
     figs.append(fig)
@@ -240,13 +269,26 @@ def main() -> None:
     # 2) Macro-F1 vs threshold (K=1)
     ths, macro_f1, macro_f1_ci = extract_metric(summary, "macro_f1", "K=1")
     fig, ax = plt.subplots(figsize=(7, 4))
-    plotted = plot_line_with_ci(ax, ths, macro_f1, macro_f1_ci, label="Macro-F1 K=1", color="#4C78A8")
-    ax.set_title("Macro-F1 vs. Identity Threshold")
-    ax.set_xlabel("Identity threshold (%)")
-    ax.set_ylabel("Macro-F1 (mean ± 95% CI)")
-    ax.grid(True, alpha=0.3)
-    if plotted:
-        ax.legend()
+    if is_multi:
+        plotted = plot_line_with_ci(ax, ths, macro_f1, macro_f1_ci, label="Macro-F1 K=1", color="#4C78A8")
+        ax.set_title("Macro-F1 vs. Identity Threshold")
+        ax.set_xlabel("Identity threshold (%)")
+        ax.set_ylabel("Macro-F1 (mean ± 95% CI)")
+        ax.grid(True, alpha=0.3)
+        if plotted:
+            ax.legend()
+    else:
+        val = macro_f1[0] if macro_f1 else float("nan")
+        ci = macro_f1_ci[0] if macro_f1_ci else 0.0
+        plot_single_bar(
+            ax,
+            x_label=f"{single_label}%",
+            mean=val,
+            ci95=ci,
+            color="#4C78A8",
+            title=f"Macro-F1 @ {single_label}%",
+            ylabel="Macro-F1 (mean ± 95% CI)",
+        )
     fig.tight_layout()
     fig.savefig(out_dir / "macro_f1_vs_threshold.png", dpi=args.dpi)
     figs.append(fig)
@@ -254,13 +296,26 @@ def main() -> None:
     # 3) Micro-F1 vs threshold (K=1)
     ths, micro_f1, micro_f1_ci = extract_metric(summary, "micro_f1", "K=1")
     fig, ax = plt.subplots(figsize=(7, 4))
-    plotted = plot_line_with_ci(ax, ths, micro_f1, micro_f1_ci, label="Micro-F1 K=1", color="#4C78A8")
-    ax.set_title("Micro-F1 vs. Identity Threshold")
-    ax.set_xlabel("Identity threshold (%)")
-    ax.set_ylabel("Micro-F1 (mean ± 95% CI)")
-    ax.grid(True, alpha=0.3)
-    if plotted:
-        ax.legend()
+    if is_multi:
+        plotted = plot_line_with_ci(ax, ths, micro_f1, micro_f1_ci, label="Micro-F1 K=1", color="#4C78A8")
+        ax.set_title("Micro-F1 vs. Identity Threshold")
+        ax.set_xlabel("Identity threshold (%)")
+        ax.set_ylabel("Micro-F1 (mean ± 95% CI)")
+        ax.grid(True, alpha=0.3)
+        if plotted:
+            ax.legend()
+    else:
+        val = micro_f1[0] if micro_f1 else float("nan")
+        ci = micro_f1_ci[0] if micro_f1_ci else 0.0
+        plot_single_bar(
+            ax,
+            x_label=f"{single_label}%",
+            mean=val,
+            ci95=ci,
+            color="#4C78A8",
+            title=f"Micro-F1 @ {single_label}%",
+            ylabel="Micro-F1 (mean ± 95% CI)",
+        )
     fig.tight_layout()
     fig.savefig(out_dir / "micro_f1_vs_threshold.png", dpi=args.dpi)
     figs.append(fig)
@@ -271,31 +326,68 @@ def main() -> None:
     _, g_top1, g_top1_ci, has_top1 = extract_global_metric(summary, "acc_top1_hit")
     if has_micro or has_macro:
         fig, ax = plt.subplots(figsize=(7, 4))
-        plotted_any = False
-        if has_micro:
-            plotted_any |= bool(plot_line_with_ci(ax, g_ths, g_micro, g_micro_ci, label="Global Micro-F1", color="#54A24B"))
-        if has_macro:
-            plotted_any |= bool(plot_line_with_ci(ax, g_ths, g_macro, g_macro_ci, label="Global Macro-F1", color="#E45756"))
-        ax.set_title("Global Support F1 vs. Identity Threshold")
-        ax.set_xlabel("Identity threshold (%)")
-        ax.set_ylabel("F1 (mean ± 95% CI)")
-        ax.grid(True, alpha=0.3)
-        if plotted_any:
-            ax.legend()
+        if is_multi:
+            plotted_any = False
+            if has_micro:
+                plotted_any |= bool(plot_line_with_ci(ax, g_ths, g_micro, g_micro_ci, label="Global Micro-F1", color="#54A24B"))
+            if has_macro:
+                plotted_any |= bool(plot_line_with_ci(ax, g_ths, g_macro, g_macro_ci, label="Global Macro-F1", color="#E45756"))
+            ax.set_title("Global Support F1 vs. Identity Threshold")
+            ax.set_xlabel("Identity threshold (%)")
+            ax.set_ylabel("F1 (mean ± 95% CI)")
+            ax.grid(True, alpha=0.3)
+            if plotted_any:
+                ax.legend()
+        else:
+            if has_micro:
+                plot_single_bar(
+                    ax,
+                    x_label=f"{single_label}%",
+                    mean=(g_micro[0] if g_micro else float("nan")),
+                    ci95=(g_micro_ci[0] if g_micro_ci else 0.0),
+                    color="#54A24B",
+                    title=f"Global Micro-F1 @ {single_label}%",
+                    ylabel="F1 (mean ± 95% CI)",
+                )
+            if has_macro:
+                ax2 = ax.twinx() if has_micro else ax
+                plot_single_bar(
+                    ax2,
+                    x_label=f"{single_label}%",
+                    mean=(g_macro[0] if g_macro else float("nan")),
+                    ci95=(g_macro_ci[0] if g_macro_ci else 0.0),
+                    color="#E45756",
+                    title=(f"Global Macro-F1 @ {single_label}%" if not has_micro else ax.get_title()),
+                    ylabel="F1 (mean ± 95% CI)",
+                )
+                if has_micro:
+                    ax.set_title(f"Global Support F1 @ {single_label}%")
         fig.tight_layout()
         fig.savefig(out_dir / "global_f1_vs_threshold.png", dpi=args.dpi)
         figs.append(fig)
 
     if has_top1:
         fig, ax = plt.subplots(figsize=(7, 4))
-        plotted_any = bool(plot_line_with_ci(ax, g_ths, g_top1, g_top1_ci, label="Global Top-1", color="#72B7B2"))
-        ax.set_title("Global Top-1 Hit vs. Identity Threshold")
-        ax.set_xlabel("Identity threshold (%)")
-        ax.set_ylabel("Top-1 hit (mean ± 95% CI)")
-        ax.set_ylim(0.0, 1.0)
-        ax.grid(True, alpha=0.3)
-        if plotted_any:
-            ax.legend()
+        if is_multi:
+            plotted_any = bool(plot_line_with_ci(ax, g_ths, g_top1, g_top1_ci, label="Global Top-1", color="#72B7B2"))
+            ax.set_title("Global Top-1 Hit vs. Identity Threshold")
+            ax.set_xlabel("Identity threshold (%)")
+            ax.set_ylabel("Top-1 hit (mean ± 95% CI)")
+            ax.set_ylim(0.0, 1.0)
+            ax.grid(True, alpha=0.3)
+            if plotted_any:
+                ax.legend()
+        else:
+            plot_single_bar(
+                ax,
+                x_label=f"{single_label}%",
+                mean=(g_top1[0] if g_top1 else float("nan")),
+                ci95=(g_top1_ci[0] if g_top1_ci else 0.0),
+                color="#72B7B2",
+                title=f"Global Top-1 Hit @ {single_label}%",
+                ylabel="Top-1 hit (mean ± 95% CI)",
+                ylim=(0.0, 1.0),
+            )
         fig.tight_layout()
         fig.savefig(out_dir / "global_top1_vs_threshold.png", dpi=args.dpi)
         figs.append(fig)
@@ -303,13 +395,26 @@ def main() -> None:
     # 5) Precision and Recall vs threshold (K=1)
     ths, macro_precision, macro_precision_ci = extract_metric(summary, "macro_precision", "K=1")
     fig, ax = plt.subplots(figsize=(7, 4))
-    plotted = plot_line_with_ci(ax, ths, macro_precision, macro_precision_ci, label="Macro-Precision K=1", color="#4C78A8")
-    ax.set_title("Macro-Precision vs. Identity Threshold")
-    ax.set_xlabel("Identity threshold (%)")
-    ax.set_ylabel("Macro-Precision (mean ± 95% CI)")
-    ax.grid(True, alpha=0.3)
-    if plotted:
-        ax.legend()
+    if is_multi:
+        plotted = plot_line_with_ci(ax, ths, macro_precision, macro_precision_ci, label="Macro-Precision K=1", color="#4C78A8")
+        ax.set_title("Macro-Precision vs. Identity Threshold")
+        ax.set_xlabel("Identity threshold (%)")
+        ax.set_ylabel("Macro-Precision (mean ± 95% CI)")
+        ax.grid(True, alpha=0.3)
+        if plotted:
+            ax.legend()
+    else:
+        val = macro_precision[0] if macro_precision else float("nan")
+        ci = macro_precision_ci[0] if macro_precision_ci else 0.0
+        plot_single_bar(
+            ax,
+            x_label=f"{single_label}%",
+            mean=val,
+            ci95=ci,
+            color="#4C78A8",
+            title=f"Macro-Precision @ {single_label}%",
+            ylabel="Macro-Precision (mean ± 95% CI)",
+        )
     fig.tight_layout()
     fig.savefig(out_dir / "macro_precision_vs_threshold.png", dpi=args.dpi)
     figs.append(fig)
@@ -317,27 +422,52 @@ def main() -> None:
     coverage_ths, coverage_means, coverage_ci, has_coverage = extract_global_metric(summary, "coverage_ratio")
     if has_coverage:
         fig, ax = plt.subplots(figsize=(7, 4))
-        plotted_any = bool(plot_line_with_ci(ax, coverage_ths, coverage_means, coverage_ci, label="Coverage", color="#B279A2"))
-        ax.set_title("Global Support Coverage vs. Identity Threshold")
-        ax.set_xlabel("Identity threshold (%)")
-        ax.set_ylabel("Coverage ratio (evaluated queries / total)")
-        ax.set_ylim(0.0, 1.05)
-        ax.grid(True, alpha=0.3)
-        if plotted_any:
-            ax.legend()
+        if is_multi:
+            plotted_any = bool(plot_line_with_ci(ax, coverage_ths, coverage_means, coverage_ci, label="Coverage", color="#B279A2"))
+            ax.set_title("Global Support Coverage vs. Identity Threshold")
+            ax.set_xlabel("Identity threshold (%)")
+            ax.set_ylabel("Coverage ratio (evaluated queries / total)")
+            ax.set_ylim(0.0, 1.05)
+            ax.grid(True, alpha=0.3)
+            if plotted_any:
+                ax.legend()
+        else:
+            plot_single_bar(
+                ax,
+                x_label=f"{single_label}%",
+                mean=(coverage_means[0] if coverage_means else float("nan")),
+                ci95=(coverage_ci[0] if coverage_ci else 0.0),
+                color="#B279A2",
+                title=f"Global Support Coverage @ {single_label}%",
+                ylabel="Coverage ratio (evaluated queries / total)",
+                ylim=(0.0, 1.05),
+            )
         fig.tight_layout()
         fig.savefig(out_dir / "global_coverage_vs_threshold.png", dpi=args.dpi)
         figs.append(fig)
 
     ths, macro_recall, macro_recall_ci = extract_metric(summary, "macro_recall", "K=1")
     fig, ax = plt.subplots(figsize=(7, 4))
-    plotted = plot_line_with_ci(ax, ths, macro_recall, macro_recall_ci, label="Macro-Recall K=1", color="#4C78A8")
-    ax.set_title("Macro-Recall vs. Identity Threshold")
-    ax.set_xlabel("Identity threshold (%)")
-    ax.set_ylabel("Macro-Recall (mean ± 95% CI)")
-    ax.grid(True, alpha=0.3)
-    if plotted:
-        ax.legend()
+    if is_multi:
+        plotted = plot_line_with_ci(ax, ths, macro_recall, macro_recall_ci, label="Macro-Recall K=1", color="#4C78A8")
+        ax.set_title("Macro-Recall vs. Identity Threshold")
+        ax.set_xlabel("Identity threshold (%)")
+        ax.set_ylabel("Macro-Recall (mean ± 95% CI)")
+        ax.grid(True, alpha=0.3)
+        if plotted:
+            ax.legend()
+    else:
+        val = macro_recall[0] if macro_recall else float("nan")
+        ci = macro_recall_ci[0] if macro_recall_ci else 0.0
+        plot_single_bar(
+            ax,
+            x_label=f"{single_label}%",
+            mean=val,
+            ci95=ci,
+            color="#4C78A8",
+            title=f"Macro-Recall @ {single_label}%",
+            ylabel="Macro-Recall (mean ± 95% CI)",
+        )
     fig.tight_layout()
     fig.savefig(out_dir / "macro_recall_vs_threshold.png", dpi=args.dpi)
     figs.append(fig)
@@ -346,11 +476,17 @@ def main() -> None:
     cluster_counts = collect_cluster_counts(results_dir, thresholds)
     cluster_trend = describe_monotonic_trend(cluster_counts)
     fig, ax = plt.subplots(figsize=(7, 4))
-    ax.bar([str(t) for t in thresholds], cluster_counts, color="#72B7B2")
-    ax.set_title("#Clusters vs. Identity Threshold")
-    ax.set_xlabel("Identity threshold (%)")
-    ax.set_ylabel("#Unique clusters (dataset)")
-    ax.grid(True, axis="y", alpha=0.3)
+    if is_multi:
+        ax.bar([str(t) for t in thresholds], cluster_counts, color="#72B7B2")
+        ax.set_title("#Clusters vs. Identity Threshold")
+        ax.set_xlabel("Identity threshold (%)")
+        ax.set_ylabel("#Unique clusters (dataset)")
+        ax.grid(True, axis="y", alpha=0.3)
+    else:
+        ax.bar([f"{single_label}%"], [cluster_counts[0] if cluster_counts else 0], color="#72B7B2")
+        ax.set_title(f"#Clusters @ {single_label}%")
+        ax.set_ylabel("#Unique clusters (dataset)")
+        ax.grid(True, axis="y", alpha=0.3)
     fig.tight_layout()
     fig.savefig(out_dir / "clusters_vs_threshold.png", dpi=args.dpi)
     figs.append(fig)
@@ -359,8 +495,11 @@ def main() -> None:
     per_fold_acc = collect_per_fold_metric(results_dir, thresholds, "acc_top1_hit", "K=1")
     fig, ax = plt.subplots(figsize=(8, 4))
     single_boxplot(ax, thresholds, per_fold_acc, label="K=1", color="#4C78A8")
-    ax.set_title("Per-fold Top-1 Accuracy by Threshold (K=1)")
-    ax.set_xlabel("Identity threshold (%)")
+    if is_multi:
+        ax.set_title("Per-fold Top-1 Accuracy by Threshold (K=1)")
+        ax.set_xlabel("Identity threshold (%)")
+    else:
+        ax.set_title(f"Per-fold Top-1 Accuracy (K=1 @ {single_label}%)")
     ax.set_ylabel("Accuracy")
     ax.set_ylim(0.0, 1.05)
     ax.grid(True, axis="y", alpha=0.3)
@@ -391,17 +530,40 @@ def main() -> None:
             f"(min {fmt.format(arr.min())}, max {fmt.format(arr.max())})"
         )
 
-    print("\n[visualize] Summary (K=1, means across thresholds):")
-    s_acc = describe_single("Top-1 accuracy", acc_vals)
-    s_macro = describe_single("Macro-F1", macro_f1)
-    s_micro = describe_single("Micro-F1", micro_f1)
-    s_precision = describe_single("Macro-Precision", macro_precision)
-    s_recall = describe_single("Macro-Recall", macro_recall)
-    s_clu = f"- #Clusters {cluster_trend} with threshold: " + " → ".join(str(c) for c in cluster_counts)
-    s_gmicro = describe_global("Global micro-F1", g_micro)
-    s_gmacro = describe_global("Global macro-F1", g_macro)
-    s_gtop1 = describe_global("Global top-1", g_top1)
-    s_cov = describe_global("Global coverage", coverage_means, fmt="{:.1%}")
+    print("\n[visualize] Summary:" + (" (K=1, means across thresholds)" if is_multi else f" (K=1 @ {single_label}%)"))
+    if is_multi:
+        s_acc = describe_single("Top-1 accuracy", acc_vals)
+        s_macro = describe_single("Macro-F1", macro_f1)
+        s_micro = describe_single("Micro-F1", micro_f1)
+        s_precision = describe_single("Macro-Precision", macro_precision)
+        s_recall = describe_single("Macro-Recall", macro_recall)
+        s_clu = f"- #Clusters {cluster_trend} with threshold: " + " → ".join(str(c) for c in cluster_counts)
+        s_gmicro = describe_global("Global micro-F1", g_micro)
+        s_gmacro = describe_global("Global macro-F1", g_macro)
+        s_gtop1 = describe_global("Global top-1", g_top1)
+        s_cov = describe_global("Global coverage", coverage_means, fmt="{:.1%}")
+    else:
+        def fmt_value(name: str, vals: List[float], cis: List[float], pct: bool = False) -> str:
+            if not vals:
+                return f"- {name} @ {single_label}%: unavailable"
+            v = vals[0]
+            c = (cis[0] if cis else 0.0)
+            if np.isnan(v):
+                return f"- {name} @ {single_label}%: unavailable"
+            if pct:
+                return f"- {name} @ {single_label}%: {v:.1%} ± {c:.1%}"
+            return f"- {name} @ {single_label}%: {v:.3f} ± {c:.3f}"
+
+        s_acc = fmt_value("Top-1 accuracy", acc_vals, acc_ci)
+        s_macro = fmt_value("Macro-F1", macro_f1, macro_f1_ci)
+        s_micro = fmt_value("Micro-F1", micro_f1, micro_f1_ci)
+        s_precision = fmt_value("Macro-Precision", macro_precision, macro_precision_ci)
+        s_recall = fmt_value("Macro-Recall", macro_recall, macro_recall_ci)
+        s_clu = f"- #Clusters @ {single_label}%: {cluster_counts[0] if cluster_counts else 'NA'}"
+        s_gmicro = fmt_value("Global micro-F1", g_micro, g_micro_ci)
+        s_gmacro = fmt_value("Global macro-F1", g_macro, g_macro_ci)
+        s_gtop1 = fmt_value("Global top-1", g_top1, g_top1_ci)
+        s_cov = fmt_value("Global coverage", coverage_means, coverage_ci, pct=True)
     for line in (s_acc, s_macro, s_micro, s_precision, s_recall, s_gmicro, s_gmacro, s_gtop1, s_cov, s_clu):
         print(line)
     print(f"[visualize] Wrote figures to: {out_dir.resolve()}")

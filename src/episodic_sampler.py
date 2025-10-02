@@ -13,6 +13,7 @@ Supports:
 """
 from __future__ import annotations
 
+import copy
 import csv
 import hashlib
 import json
@@ -21,7 +22,7 @@ import random
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import DefaultDict, Dict, List, Optional, Set, Tuple
+from typing import Any, DefaultDict, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import torch
@@ -179,6 +180,26 @@ class EpisodeSampler:
     # ---------------------------------------------------------------------
     # Helpers
     # ---------------------------------------------------------------------
+    def snapshot_state(self) -> Dict[str, Any]:
+        """Return a copy of the internal RNG state for reproducible replays."""
+
+        return {
+            "random": self.rng.getstate(),
+            "np": copy.deepcopy(self._np_rng.bit_generator.state),
+        }
+
+    def restore_state(self, state: Dict[str, Any]) -> None:
+        """Restore RNG state captured via :meth:`snapshot_state`."""
+
+        if not state:
+            return
+        rand_state = state.get("random")
+        if rand_state is not None:
+            self.rng.setstate(rand_state)
+        np_state = state.get("np")
+        if np_state is not None:
+            self._np_rng.bit_generator.state = np_state
+
     def _idx2acc(self, idx: int) -> str:
         return str(self.keys[idx])  # type: ignore[index]
 

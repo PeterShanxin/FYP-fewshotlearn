@@ -2,6 +2,8 @@
 
 - Prints key config at start
 - Tracks episodic val accuracy; saves best checkpoint
+- Optionally saves last checkpoint and re-checks best vs last on a larger
+  validation slice at the end to select the final checkpoint
 - Writes results/history.json with simple metrics
 """
 from __future__ import annotations
@@ -108,6 +110,17 @@ def episodic_accuracy(
                     correct += int((pred == qy).sum().item())
                     total += int(qy.numel())
     return correct / max(total, 1)
+
+
+def _state_dict_cpu(sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Copy a state_dict to CPU (to reduce GPU memory pressure while caching)."""
+    out: Dict[str, torch.Tensor] = {}
+    for k, v in sd.items():
+        try:
+            out[k] = v.detach().to("cpu")
+        except Exception:
+            out[k] = v.detach()
+    return out
 
 
 def _apply_hierarchy_loss(
@@ -290,6 +303,12 @@ def main() -> None:
     # Validation cadence and size knobs
     eval_every = int(cfg.get("eval_every", max(50, n_train // 10)))
     episodes_per_val_check = int(cfg.get("episodes_per_val_check", 50))
+    # Early stopping and improvement sensitivity
+    patience_checks = int(cfg.get("patience_checks", 10))
+    min_delta = float(cfg.get("min_delta", 0.0))
+    # Save options and final selection
+    save_last = bool(cfg.get("save_last", True))
+    final_val_episodes = int(cfg.get("final_val_episodes", 0))
 
     show_progress = bool(cfg.get("progress", True))
     verbose = bool(cfg.get("verbose", show_progress))
@@ -310,6 +329,10 @@ def main() -> None:
         "fp16_train": use_amp,
         "eval_every": eval_every,
         "episodes_per_val_check": episodes_per_val_check,
+        "patience_checks": patience_checks,
+        "min_delta": min_delta,
+        "save_last": save_last,
+        "final_val_episodes": final_val_episodes,
         "multi_label": multi_label,
         "identity_disjoint": disjoint,
         "rare_class_boost": rare_class_boost,
@@ -321,8 +344,8 @@ def main() -> None:
 
     best_acc = -1.0
     best_state = None
+    last_state = None
     history = {"val_acc": [], "checkpoints_after_episode": []}
-    patience_checks = 10
     checks_without_improve = 0
 
     model.train()
@@ -367,9 +390,9 @@ def main() -> None:
                 pbar.set_postfix({"val_acc": f"{acc:.4f}", "best": f"{max(best_acc, 0):.4f}"}, refresh=True)
             elif verbose:
                 print(f"[train] episode {ep+1}: val_acc={acc:.4f}")
-            if acc > best_acc:
+            if acc > (best_acc + min_delta):
                 best_acc = acc
-                best_state = {"model": model.state_dict()}
+                best_state = {"model": _state_dict_cpu(model.state_dict())}
                 checks_without_improve = 0
                 if show_progress:
                     pbar.set_postfix({"val_acc": f"{acc:.4f}", "best": f"{best_acc:.4f}", "note": "new best"}, refresh=True)
@@ -385,25 +408,118 @@ def main() -> None:
     if show_progress:
         pbar.close()
 
-    # Save best checkpoint
+    # Prepare checkpoints directory
     out_dir = Path(paths["outputs"]) / "checkpoints"
     out_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_path = out_dir / "protonet.pt"
+
+    # Always capture the last state dict
+    try:
+        last_state = {"model": _state_dict_cpu(model.state_dict())}
+    except Exception:
+        last_state = {"model": model.state_dict()}
+
+    # Ensure we have at least something to save as best
     if best_state is None:
-        best_state = {"model": model.state_dict()}
-    torch.save(best_state, ckpt_path)
+        best_state = last_state
+
+    # Optional final re-check on a larger validation slice: best vs last
+    final_choice = "best"
+    final_best_acc = best_acc
+    if has_val and final_val_episodes > 0:
+        if verbose:
+            print(f"[train] Final re-check: evaluating best vs last on {final_val_episodes} val episodes …")
+        sampler_state = val_sampler.snapshot_state()
+
+        # Evaluate best
+        try:
+            model.load_state_dict(best_state["model"], strict=False)  # type: ignore[index]
+        except Exception:
+            pass
+        acc_best = episodic_accuracy(
+            model,
+            val_sampler,
+            M_val,
+            K_val,
+            Q_val,
+            episodes=min(final_val_episodes, n_val_eval),
+            show_progress=show_progress,
+            multi_label=multi_label,
+        )
+        val_sampler.restore_state(sampler_state)
+
+        # Evaluate last
+        try:
+            model.load_state_dict(last_state["model"], strict=False)  # type: ignore[index]
+        except Exception:
+            pass
+        acc_last = episodic_accuracy(
+            model,
+            val_sampler,
+            M_val,
+            K_val,
+            Q_val,
+            episodes=min(final_val_episodes, n_val_eval),
+            show_progress=show_progress,
+            multi_label=multi_label,
+        )
+        # Restore sampler state so subsequent consumers see a consistent progression
+        val_sampler.restore_state(sampler_state)
+        if acc_last > acc_best + 1e-12:
+            final_choice = "last"
+            final_best_acc = acc_last
+            if verbose:
+                print(f"[train] Final selection: last (acc={acc_last:.4f}) > best (acc={acc_best:.4f})")
+        else:
+            final_choice = "best"
+            final_best_acc = acc_best
+            if verbose:
+                print(f"[train] Final selection: best (acc={acc_best:.4f}) >= last (acc={acc_last:.4f})")
+        # Load the chosen weights back into the model for downstream save
+        chosen = best_state if final_choice == "best" else last_state
+        try:
+            model.load_state_dict(chosen["model"], strict=False)  # type: ignore[index]
+        except Exception:
+            pass
+    else:
+        # Keep model as-is (last) if no final re-check requested
+        final_choice = "best"
+        final_best_acc = best_acc
+
+    # Save checkpoints
+    ckpt_path = out_dir / "protonet.pt"
+    chosen_state = {"model": model.state_dict()}
+    torch.save(chosen_state, ckpt_path)
+    # Optionally persist best and last for inspection
+    if save_last:
+        try:
+            torch.save(best_state, out_dir / "protonet.best.pt")
+        except Exception:
+            pass
+        try:
+            torch.save(last_state, out_dir / "protonet.last.pt")
+        except Exception:
+            pass
 
     # Save history
     hist_path = Path(paths["outputs"]) / "history.json"
     with open(hist_path, "w") as f:
-        json.dump(dict(history=history, best_val_acc=float(best_acc)), f, indent=2)
+        json.dump(
+            dict(
+                history=history,
+                best_val_acc=float(best_acc),
+                final_choice=str(final_choice),
+                final_val_acc=float(final_best_acc if final_best_acc is not None else best_acc),
+            ),
+            f,
+            indent=2,
+        )
 
     try:
         train_sampler.write_usage_csv(usage_dir)
     except Exception as exc:  # pragma: no cover - diagnostics only
         print(f"[train] WARNING: failed to write sampler stats ({exc})")
 
-    print(f"[train] best_val_acc={best_acc:.4f} | checkpoint → {ckpt_path}")
+    print(f"[train] best_val_acc={best_acc:.4f} | final_choice={final_choice} | checkpoint → {ckpt_path}")
 
 
 if __name__ == "__main__":

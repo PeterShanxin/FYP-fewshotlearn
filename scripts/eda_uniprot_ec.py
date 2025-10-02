@@ -166,11 +166,11 @@ def make_matplotlib_plots(long_df: pd.DataFrame, out_dir: Path, top_k: int) -> l
     if plt is None:
         return ["matplotlib not available; skipped PNG plots"]
     notes = []
-    # Bar: EC1 distribution
+    # Bar: ECx distribution (generic formatting)
     save_bar_png(
         plt,
         long_df["ec1"].value_counts(),
-        title="EC1 distribution",
+        title="ECx distribution",
         out_path=out_dir / "ec1_distribution.png",
         top_k=50,
     )
@@ -193,7 +193,8 @@ def make_matplotlib_plots(long_df: pd.DataFrame, out_dir: Path, top_k: int) -> l
         .sort_index(axis=0)
         .sort_index(axis=1)
     )
-    save_heatmap_png(plt, piv12, "EC1 x EC2 counts", out_dir / "heatmap_ec1_ec2.png")
+    # Heatmaps with generic ECx-style titles
+    save_heatmap_png(plt, piv12, "ECx vs ECx.x (counts)", out_dir / "heatmap_ec1_ec2.png")
     notes.append("Saved heatmap_ec1_ec2.png")
 
     piv23 = (
@@ -201,7 +202,7 @@ def make_matplotlib_plots(long_df: pd.DataFrame, out_dir: Path, top_k: int) -> l
         .sort_index(axis=0)
         .sort_index(axis=1)
     )
-    save_heatmap_png(plt, piv23, "EC2 x EC3 counts", out_dir / "heatmap_ec2_ec3.png")
+    save_heatmap_png(plt, piv23, "ECx.x vs ECx.x.x (counts)", out_dir / "heatmap_ec2_ec3.png")
     notes.append("Saved heatmap_ec2_ec3.png")
 
     return notes
@@ -221,7 +222,7 @@ def make_plotly_figures(long_df: pd.DataFrame, out_dir: Path) -> list[str]:
         values="count",
         color="ec1",
         color_discrete_sequence=px.colors.qualitative.Set3,
-        title="EC hierarchy sunburst (counts)"
+        title="EC hierarchy (ECx → ECx.x → ECx.x.x → ECx.x.x.x)"
     )
     out_sb = out_dir / "sunburst_ec_hierarchy.html"
     fig_sb.write_html(str(out_sb))
@@ -258,7 +259,7 @@ def make_plotly_figures(long_df: pd.DataFrame, out_dir: Path) -> list[str]:
             )
         ]
     )
-    fig_sk.update_layout(title_text="EC flow Sankey (EC1→EC4)")
+    fig_sk.update_layout(title_text="EC flow Sankey (ECx → ECx.x → ECx.x.x → ECx.x.x.x)")
     out_sk = out_dir / "sankey_ec_flow.html"
     fig_sk.write_html(str(out_sk))
     notes.append("Saved sankey_ec_flow.html")
@@ -328,4 +329,3 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"[error] {e}", file=sys.stderr)
         sys.exit(1)
-

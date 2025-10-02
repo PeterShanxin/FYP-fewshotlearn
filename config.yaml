@@ -23,7 +23,7 @@ modules:
 # Episode settings (few-shot task shape)
 episode:
   M_train: 10        # training ways
-  K_train: 3         # training shots (increase for robustness with TrEMBL)
+  K_train: 1         # training shots (lab scenario)
   Q_train: 5         # training queries per class
   M_val: 10          # validation/test ways
   K_val: 1           # validation/test shots
@@ -62,18 +62,41 @@ sampler:
   identity_disjoint: true
   with_replacement_fallback: true          # train only, for classes with count < K+Q
   fallback_scope: train_only
-  rare_class_boost: inverse_log_freq       # sample tail ECs more often
+  # rare_class_boost: inverse_log_freq       # sample tail ECs more often
+  rare_class_boost: none                  # uniform sampling
 
 eval:
   mode: global_support                     # new mode
   shortlist_topN: 200                      # optional prefilter for speed; 0 disables
   temperature: 0.07
   tau_multi: 0.35                          # global multi-label threshold
+  # Toggles: whether evaluation should consume tuned parameters
+  use_calibration: true                    # if true and calibration JSON exists, override tau/temperature
+  use_per_ec_thresholds: true              # if true and per-EC thresholds JSON is provided, apply it
   per_ec_thresholds_path: null             # optional JSON of {ec: tau}
   subprototypes_per_ec: 1                  # if >1, cluster supports per EC and store Kmeans centroids
   prototypes_path: artifacts/prototypes.npz
   calibration_path: artifacts/calibration.json
   split: test
+
+# Global-support prototype source control
+# Options: 'mixed' (use train split as-is; includes TrEMBL if augmented),
+#          'SwissProt' (filter prototypes to reviewed accessions only)
+prototypes_source: mixed
+
+# Optional local TrEMBL mirror controls (used by run_all.sh if enabled)
+trembl_topup:
+  enable: true
+  offline: true               # if true, skip fetch use cached data
+  cache_dir: data/uniprot_ec/trembl_cache
+  per_ec_cap: 100
+  overshoot: 2
+  fetch_overshoot_pct: 0.15
+  refresh_days: 30
+  concurrency: 4
+  rps: 8.0
+  timeout: 60
+  max_ecs: null
 
 # Identity clustering (pipeline-generated)
 cluster_identity: 0.5         # sequence identity threshold for clustering

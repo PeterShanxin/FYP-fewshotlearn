@@ -365,6 +365,10 @@ def run_global_evaluation(
     eval_cfg = cfg.get("eval", {}) or {}
     show_progress = bool(cfg.get("progress", True))
 
+    # New toggles to control whether tuned params are consumed
+    use_calibration = bool(eval_cfg.get("use_calibration", True))
+    use_per_ec = bool(eval_cfg.get("use_per_ec_thresholds", True))
+
     base_tau = float(eval_cfg.get("tau_multi", 0.35))
     base_temp = float(eval_cfg.get("temperature", 0.07))
     base_shortlist = int(eval_cfg.get("shortlist_topN", 0))
@@ -374,8 +378,8 @@ def run_global_evaluation(
     shortlist = int(shortlist_topN if shortlist_topN is not None else base_shortlist)
     ensure_top1 = bool(eval_cfg.get("ensure_top1", True))
 
-    thresholds = _load_thresholds(thresholds_path)
-    if calibration_path is not None and calibration_path.exists():
+    thresholds = _load_thresholds(thresholds_path) if (use_per_ec and thresholds_path is not None) else {}
+    if use_calibration and calibration_path is not None and calibration_path.exists():
         with open(calibration_path, "r", encoding="utf-8") as handle:
             calib = json.load(handle)
         if tau_multi is None and "tau_multi" in calib:

@@ -242,8 +242,12 @@ def main() -> None:
     else:
         tau_multi = 0.6
 
+    # Honor toggles for tuned parameters
+    use_calibration = bool(eval_cfg.get("use_calibration", True))
+    use_per_ec = bool(eval_cfg.get("use_per_ec_thresholds", True))
+
     calibration_path_raw = eval_cfg.get("calibration_path")
-    if calibration_path_raw:
+    if use_calibration and calibration_path_raw:
         calibration_path = Path(calibration_path_raw)
         if calibration_path.exists():
             try:
@@ -258,7 +262,7 @@ def main() -> None:
 
     thresholds_path_raw = eval_cfg.get("per_ec_thresholds_path")
     per_ec_thresholds: Dict[str, float] | None = None
-    if thresholds_path_raw:
+    if use_per_ec and thresholds_path_raw:
         thresholds_path = Path(thresholds_path_raw)
         if thresholds_path.exists():
             try:

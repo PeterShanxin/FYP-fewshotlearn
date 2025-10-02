@@ -49,6 +49,17 @@ tau_multi: 0.60
 # Ensure splits are built from Swiss-Prot only when using a merged joined TSV
 split_source: SwissProt
 
+trembl_topup:
+  enable: true
+  cache_dir: data/uniprot_ec/trembl_cache_smoke
+  per_ec_cap: 3
+  overshoot: 1
+  refresh_days: 7
+  concurrency: 2
+  rps: 4.0
+  timeout: 60
+  max_ecs: 10
+
 sampler:
   identity_disjoint: true
   with_replacement_fallback: true
@@ -60,6 +71,8 @@ eval:
   shortlist_topN: 0
   temperature: 0.07
   tau_multi: 0.35
+  use_calibration: true
+  use_per_ec_thresholds: true
   per_ec_thresholds_path: null
   subprototypes_per_ec: 1
   prototypes_path: artifacts/prototypes_smoke.npz

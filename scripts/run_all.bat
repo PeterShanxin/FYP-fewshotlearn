@@ -21,8 +21,8 @@ if errorlevel 1 (
 )
 
 :: 1.5) Targeted TrEMBL top-up (build merged joined TSV)
-echo [run_all] Top-up: SwissProt + targeted TrEMBL
-python scripts/topup_trembl_targeted.py --config %CFG% --target-min auto --buffer 2 --cap-per-ec 50 --max-ecs 2000
+echo [run_all] Top-up: SwissProt + selective TrEMBL cache
+python scripts/topup_trembl_targeted.py --config %CFG%
 if errorlevel 1 (
   echo [run_all] [warn] Top-up step failed; proceeding with Swiss-Prot only
 )
@@ -32,7 +32,7 @@ python -m src.prepare_split -c %CFG%
 if errorlevel 1 goto :error
 
 :: 2.1) Augment train split now that splits exist
-python scripts/topup_trembl_targeted.py --config %CFG% --target-min auto --buffer 2 --augment-train --augment-only
+python scripts/topup_trembl_targeted.py --config %CFG% --augment-only --offline
 if errorlevel 1 (
   echo [run_all] [warn] Train augmentation step failed; continuing
 )

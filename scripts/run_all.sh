@@ -123,13 +123,8 @@ RESULTS_DIR=$(python - "${CFG}" <<'PY'
 import sys
 from pathlib import Path
 import yaml
-
-cfg_path = Path(sys.argv[1])
-with open(cfg_path, 'r', encoding='utf-8') as f:
-    cfg = yaml.safe_load(f) or {}
-paths = cfg.get('paths', {}) or {}
-out_dir = Path(paths.get('outputs', 'results')).resolve()
-print(out_dir)
+cfg = yaml.safe_load(open(sys.argv[1], 'r', encoding='utf-8')) or {}
+print(Path((cfg.get('paths') or {}).get('outputs', 'results')).resolve())
 PY
 )
 
@@ -137,6 +132,8 @@ LOG_DIR="${RESULTS_DIR}/logs"
 STATUS_LOG="${LOG_DIR}/run_all_status.log"
 mkdir -p "$LOG_DIR"
 : > "$STATUS_LOG"
+TOPUP_SUMMARY_JSON="${LOG_DIR}/trembl_topup_summary.json"
+rm -f "$TOPUP_SUMMARY_JSON"
 log_line "python path=$(command -v python)"
 
 # Optionally load HPC modules declared in config (modules: [MMseqs2])
@@ -240,29 +237,75 @@ else
 fi
 phase_complete "fetch"
 
-# 1.5) Targeted TrEMBL top-up → merged joined TSV (SwissProt + TrEMBL)
-phase_begin "topup"
-TOPUP_STATUS="success"
-if python scripts/topup_trembl_targeted.py -c "${CFG}" --target-min auto --buffer 2 --cap-per-ec 50 --max-ecs 2000 --augment-train; then
-  echo "[run_all] Top-up merged TSV ready (SwissProt + targeted TrEMBL)"
-  log_line "phase=topup detail=topup_trembl status=success"
-else
-  echo "[run_all][warn] Top-up step failed; proceeding with Swiss‑Prot only" >&2
-  log_line "phase=topup detail=topup_trembl status=failed"
-  TOPUP_STATUS="failed"
+# 1.1) Optional: selective TrEMBL cache/merge before prepare_split
+TOPUP_ENABLED=$(python - "${CFG}" <<'PY'
+import sys, yaml
+cfg = yaml.safe_load(open(sys.argv[1])) or {}
+top = cfg.get('trembl_topup', {}) or {}
+print(str(bool(top.get('enable', False))).lower())
+PY
+)
+TOPUP_OFFLINE=$(python - "${CFG}" <<'PY'
+import sys, yaml
+cfg = yaml.safe_load(open(sys.argv[1])) or {}
+top = cfg.get('trembl_topup', {}) or {}
+print(str(bool(top.get('offline', False))).lower())
+PY
+)
+if [ "${TOPUP_OFFLINE}" = "true" ]; then OFFLINE_FLAG="--offline"; else OFFLINE_FLAG=""; fi
+if [ "${TOPUP_ENABLED}" = "true" ]; then
+  rm -f "$TOPUP_SUMMARY_JSON"
+  phase_begin "trembl_topup_fetch"
+  if python -u scripts/topup_trembl_targeted.py -c "${CFG}" --summary-json "${TOPUP_SUMMARY_JSON}" ${OFFLINE_FLAG}; then
+    log_line "phase=trembl_topup_fetch status=success"
+    if [ -f "$TOPUP_SUMMARY_JSON" ]; then
+      SUMMARY_LINE=$(python - "${TOPUP_SUMMARY_JSON}" <<'PY'
+import json, sys
+with open(sys.argv[1], 'r', encoding='utf-8') as fh:
+    data = json.load(fh)
+needed = int(data.get('needed_before', 0) or 0)
+remaining = int(data.get('remaining_after_base', 0) or 0)
+remaining_aug = int(data.get('remaining_after_aug', 0) or 0)
+target_base = data.get('target_min_base')
+target_aug = data.get('target_min_aug')
+added = int(data.get('trembl_added', 0) or 0)
+fetch_pct = data.get('fetch_overshoot_pct')
+try:
+    fetch_pct = float(fetch_pct)
+except Exception:
+    fetch_pct = None
+fetch_str = 'NA' if fetch_pct is None else f"{fetch_pct:.3f}"
+if target_base is None:
+    target_base = 'NA'
+if target_aug is None:
+    target_aug = 'NA'
+print(
+    f"phase=trembl_topup_fetch detail=ec_counts needed_before={needed} "
+    f"remaining_after={remaining} remaining_after_aug={remaining_aug} "
+    f"target_min_base={target_base} target_min_aug={target_aug} trembl_added={added} "
+    f"fetch_overshoot_pct={fetch_str}"
+)
+PY
+)
+      log_line "$SUMMARY_LINE"
+      rm -f "$TOPUP_SUMMARY_JSON"
+    fi
+    phase_complete "trembl_topup_fetch" "success"
+  else
+    log_line "phase=trembl_topup_fetch status=failed"
+    rm -f "$TOPUP_SUMMARY_JSON"
+    phase_complete "trembl_topup_fetch" "failed"
+  fi
 fi
-phase_complete "topup" "$TOPUP_STATUS"
 
 # Improve CUDA allocation behavior for large batches/models
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 log_line "env event=set PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF}"
 
 # Identity benchmark (single or multi) based solely on id_thresholds in config
-read -r CUTOFFS CUTOFFS_PCT_STR FOLDS MULTI <<EOF
-$(python - "${CFG}" <<'PY'
+eval $(python - "${CFG}" <<'PY'
 import sys, yaml
-with open(sys.argv[1], 'r') as f:
-    cfg = yaml.safe_load(f)
+cfg = yaml.safe_load(open(sys.argv[1])) or {}
 ths = cfg.get('id_thresholds')
 cuts = None
 if isinstance(ths, (list, tuple)) and len(ths) > 0:
@@ -277,15 +320,20 @@ try:
 except Exception:
     folds = 5
 if not cuts:
-    print('NA NA', folds, 0)
+    print('CUTOFFS=NA')
+    print(f'CUTOFFS_PCT_STR=NA')
+    print(f'FOLDS={folds}')
+    print('MULTI=0')
 else:
     pct_str = ",".join(str(int(round(c*100))) for c in cuts)
     dec_str = ",".join(str(c) for c in cuts)
     multi = '1' if len(cuts) > 1 else '0'
-    print(dec_str, pct_str, folds, multi)
+    print(f'CUTOFFS={dec_str}')
+    print(f'CUTOFFS_PCT_STR={pct_str}')
+    print(f'FOLDS={folds}')
+    print(f'MULTI={multi}')
 PY
 )
-EOF
 
 if [ "$CUTOFFS" = "NA" ]; then
   echo "[run_all][error] 'id_thresholds' is missing or invalid in ${CFG}. Set, e.g.: id_thresholds: [50] or [10,30,50,70,100]" >&2
@@ -302,109 +350,61 @@ log_line "config id_thresholds=${CUTOFFS_PCT_STR} folds=${FOLDS} multi=${MULTI}"
 if [ "$FORCE_EMBED" -eq 1 ]; then FE_FLAG="--force-embed"; else FE_FLAG=""; fi
 SKIP_PREPARE_FLAG=""
 phase_begin "prepare_splits"
-read -r HAVE_CACHED_SPLITS <<EOF
-$(python - "${CFG}" "${CUTOFFS}" "${FOLDS}" <<'PY'
-import json
-import sys
+eval $(python - "${CFG}" "${CUTOFFS}" "${FOLDS}" <<'PY'
+import json, sys
 from pathlib import Path
-
 import yaml
 
-
 def parse_cutoffs(raw: str) -> list[float]:
-    values: list[float] = []
-    for chunk in raw.split(","):
+    vals = []
+    for chunk in (raw or '').split(','):
         chunk = chunk.strip()
         if not chunk:
             continue
-        try:
-            val = float(chunk)
-        except ValueError:
-            continue
-        if val > 1.0:
-            val = val / 100.0
-        values.append(val)
-    return values
+        v = float(chunk)
+        if v > 1.0:
+            v = v/100.0
+        vals.append(v)
+    return vals
 
-
-def path_exists(path: Path) -> bool:
-    try:
-        return path.exists()
-    except OSError:
-        return False
-
-
-cfg_path, cutoffs_raw, folds_raw = sys.argv[1:4]
+cfg = yaml.safe_load(open(sys.argv[1])) or {}
+cutoffs = parse_cutoffs(sys.argv[2])
 try:
-    folds = int(folds_raw)
+    folds = int(sys.argv[3])
 except Exception:
-    print("0")
-    sys.exit(0)
+    folds = 5
+paths = cfg.get('paths', {}) or {}
+outputs = Path(paths.get('outputs', 'results')).resolve()
+identity_def = str(cfg.get('identity_definition', 'tool_default'))
+stratify_by = str(cfg.get('stratify_by', 'EC_top'))
+seed = int(cfg.get('random_seed', 42))
 
-cutoffs = parse_cutoffs(cutoffs_raw)
-if not cutoffs:
-    print("0")
-    sys.exit(0)
-
-with open(cfg_path, "r", encoding="utf-8") as f:
-    cfg = yaml.safe_load(f) or {}
-
-paths = cfg.get("paths", {}) or {}
-outputs = Path(paths.get("outputs", "results")).resolve()
-identity_def = str(cfg.get("identity_definition", "tool_default"))
-stratify_by = str(cfg.get("stratify_by", "EC_top"))
-seed = int(cfg.get("random_seed", 42))
-
-ok = True
+ok = True if cutoffs else False
 for cutoff in cutoffs:
-    pct = int(round(cutoff * 100))
+    pct = int(round(cutoff*100))
     split_dir = outputs / f"split-{pct}"
-    config_used = split_dir / "config.used.yaml"
-    folds_json = split_dir / "folds.json"
-    if not (path_exists(config_used) and path_exists(folds_json)):
-        ok = False
-        break
-    try:
-        used_cfg = yaml.safe_load(config_used.read_text(encoding="utf-8")) or {}
-    except Exception:
-        ok = False
-        break
-    if int(used_cfg.get("id_threshold", -1)) != pct:
-        ok = False
-        break
-    if int(used_cfg.get("folds", folds)) != folds:
-        ok = False
-        break
-    if str(used_cfg.get("identity_definition", identity_def)) != identity_def:
-        ok = False
-        break
-    if str(used_cfg.get("stratify_by", stratify_by)) != stratify_by:
-        ok = False
-        break
-    if int(used_cfg.get("random_seed", seed)) != seed:
-        ok = False
-        break
-    try:
-        folds_info = json.loads(folds_json.read_text(encoding="utf-8"))
-    except Exception:
-        ok = False
-        break
-    folds_map = folds_info.get("folds", {}) or {}
-    if len(folds_map) != folds:
-        ok = False
-        break
-    for idx in range(1, folds + 1):
+    config_used = split_dir / 'config.used.yaml'
+    folds_json = split_dir / 'folds.json'
+    if not (config_used.exists() and folds_json.exists()):
+        ok = False; break
+    used_cfg = yaml.safe_load(config_used.read_text(encoding='utf-8')) or {}
+    if int(used_cfg.get('id_threshold', -1)) != pct: ok=False; break
+    if int(used_cfg.get('folds', folds)) != folds: ok=False; break
+    if str(used_cfg.get('identity_definition', identity_def)) != identity_def: ok=False; break
+    if str(used_cfg.get('stratify_by', stratify_by)) != stratify_by: ok=False; break
+    if int(used_cfg.get('random_seed', seed)) != seed: ok=False; break
+    folds_info = json.loads(folds_json.read_text(encoding='utf-8'))
+    folds_map = folds_info.get('folds', {}) or {}
+    if len(folds_map) != folds: ok=False; break
+    for idx in range(1, folds+1):
         fold_dir = split_dir / f"fold-{idx}"
-        if not (path_exists(fold_dir / "train.jsonl") and path_exists(fold_dir / "val.jsonl") and path_exists(fold_dir / "test.jsonl")):
-            ok = False
-            break
-    if not ok:
-        break
+        if not ((fold_dir / 'train.jsonl').exists() and (fold_dir / 'val.jsonl').exists() and (fold_dir / 'test.jsonl').exists()):
+            ok = False; break
+    if not ok: break
 
-print("1" if ok else "0")
+print(f"HAVE_CACHED_SPLITS={'1' if ok else '0'}")
 PY
 )
-EOF
 
 prepare_status="success"
 if [ "$HAVE_CACHED_SPLITS" = "1" ]; then
@@ -418,6 +418,17 @@ else
   log_line "phase=prepare_splits detail=generated thresholds=${CUTOFFS_PCT_STR} folds=${FOLDS}"
 fi
 phase_complete "prepare_splits" "$prepare_status"
+
+if [ "${TOPUP_ENABLED}" = "true" ]; then
+  phase_begin "trembl_topup_augment"
+  if python -u scripts/topup_trembl_targeted.py -c "${CFG}" --augment-only --offline; then
+    log_line "phase=trembl_topup_augment status=success"
+    phase_complete "trembl_topup_augment" "success"
+  else
+    log_line "phase=trembl_topup_augment status=failed"
+    phase_complete "trembl_topup_augment" "failed"
+  fi
+fi
 
 phase_begin "benchmark"
 python scripts/run_identity_benchmark.py -c "${CFG}" --cutoffs "${CUTOFFS}" --folds "${FOLDS}" ${FE_FLAG} ${SKIP_PREPARE_FLAG}

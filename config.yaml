@@ -90,11 +90,11 @@ prototypes_source: mixed
 # Optional local TrEMBL mirror controls (used by run_all.sh if enabled)
 trembl_topup:
   enable: true
-  offline: true               # if true, skip fetch use cached data
+  offline: false               # if true, skip fetch use cached data
   cache_dir: data/uniprot_ec/trembl_cache
   per_ec_cap: 100
-  overshoot: 2
-  fetch_overshoot_pct: 0.15
+  overshoot: 3
+  fetch_overshoot_pct: 0.2
   refresh_days: 30
   concurrency: 4
   rps: 8.0
@@ -107,9 +107,9 @@ cluster_coverage: 0.7         # minimum coverage fraction for MMseqs2 clustering
 identity_cluster_backend: linclust  # use MMseqs linclust backend for identity components
 
 # Identity benchmark (multi-threshold CV)
-id_thresholds: [30, 50, 70, 100]
+# id_thresholds: [30, 50, 70, 100]
 # folds: 5 # CLEAN group's set-up
-# id_thresholds: [50]
+id_thresholds: [70]
 folds: 5
 identity_definition: tool_default      # global_pairwise | local_pairwise | tool_default
 clustering_method: existing_id_cluster_module

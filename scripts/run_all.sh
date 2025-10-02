@@ -436,6 +436,32 @@ log_line "phase=benchmark detail=run_identity_benchmark status=success"
 phase_complete "benchmark"
 
 phase_begin "visualize"
+OUT_FIG_DIR="${RESULTS_DIR}/figures"
+LASTRUN_DIR="${RESULTS_DIR}/lastrun"
+# Archive previous visualization output and config into lastrun
+mkdir -p "${RESULTS_DIR}"
+if [ -d "${OUT_FIG_DIR}" ] || [ -f "${OUT_FIG_DIR}" ]; then
+  # Reset lastrun to hold the previous run's artifacts only
+  rm -rf "${LASTRUN_DIR}"
+  mkdir -p "${LASTRUN_DIR}"
+  if mv "${OUT_FIG_DIR}" "${LASTRUN_DIR}/figures" 2>/dev/null; then
+    echo "[run_all][viz] Archived previous figures → ${LASTRUN_DIR}/figures"
+    log_line "phase=visualize_backup event=archive source=${OUT_FIG_DIR} dest=${LASTRUN_DIR}/figures status=success"
+  else
+    echo "[run_all][viz][warn] No prior figures to archive or move failed"
+    log_line "phase=visualize_backup event=archive status=skipped"
+  fi
+else
+  # Ensure lastrun is a clean directory when no prior figures exists
+  rm -rf "${LASTRUN_DIR}"
+  mkdir -p "${LASTRUN_DIR}"
+  log_line "phase=visualize_backup event=no_prior_figures"
+fi
+# Store the current config used for this run into lastrun for reference
+if [ -f "${CFG}" ]; then
+  cp -f "${CFG}" "${LASTRUN_DIR}/config.yaml" || true
+  log_line "phase=visualize_backup event=store_config path=${LASTRUN_DIR}/config.yaml"
+fi
 VIS_STATUS="skipped"
 if python - <<'PY'
 try:

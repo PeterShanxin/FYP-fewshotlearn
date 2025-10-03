@@ -152,12 +152,12 @@ Notes:
 
 ---
 
-## Defaults (tuned for low resource)
+## Defaults
 See `config.yaml` for all knobs. Key defaults:
 
 - `embedding.model`: `esm2_t12_35M_UR50D`
 - `device`: auto (CUDA if available else CPU)
-- Episodes – `M=10`, `K_train=5`, `K_eval=[1,5]`, `Q=10`
+- Episodes – `M=10`, `K=3`, `Q=5/10`
 - Train/val episodes: `1000` / `200`
 - `batch_size_embed=64` (raise on GPU; reduce on CPU)
 - ProtoNet: 256‑dim optional projection, cosine scores scaled by `temperature=10.0`

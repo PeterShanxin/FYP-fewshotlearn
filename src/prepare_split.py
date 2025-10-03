@@ -65,17 +65,20 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
 def apply_split_source_filter(df: pd.DataFrame, split_source: str | None) -> pd.DataFrame:
     """Filter to a specific source if requested.
 
-    If 'source' column is present in df and split_source is provided, keep only
-    those rows. If the column is missing but split_source equals 'SwissProt', we
-    assume all rows are Swiss‑Prot and return df unchanged.
+    If a 'source' column is present (case-insensitive) and ``split_source`` is
+    provided, retain only those rows. If the column is missing but
+    ``split_source`` equals 'SwissProt', treat the file as Swiss‑Prot-only and
+    return the frame unchanged.
     """
     if split_source is None:
         return df
-    cols = [c.lower() for c in df.columns]
-    if "source" not in cols:
+    # Build a case-insensitive mapping of column names
+    name_map = {c.lower(): c for c in df.columns}
+    if "source" not in name_map:
         # Treat as Swiss‑Prot only file
         return df
-    mask = df["source"].astype(str) == str(split_source)
+    col = name_map["source"]
+    mask = df[col].astype(str) == str(split_source)
     return df[mask]
 
 

@@ -1,4 +1,3 @@
-
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -132,6 +131,10 @@ LOG_DIR="${RESULTS_DIR}/logs"
 STATUS_LOG="${LOG_DIR}/run_all_status.log"
 mkdir -p "$LOG_DIR"
 : > "$STATUS_LOG"
+# Expose status log to subprocesses (Python) so they can append detailed phase logs
+export RUNALL_STATUS_LOG="$STATUS_LOG"
+# Keep timezone consistent with bash logger
+export RUNALL_TZ="Asia/Singapore"
 TOPUP_SUMMARY_JSON="${LOG_DIR}/trembl_topup_summary.json"
 rm -f "$TOPUP_SUMMARY_JSON"
 log_line "python path=$(command -v python)"

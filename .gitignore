@@ -11,6 +11,12 @@ data/identity/clusters*.tsv
 # Results (training/eval outputs)
 results/
 
+# Run artifacts (usage stats, per-fold outputs, ad-hoc runs)
+runs/
+
+# Serialized prototype/calibration artifacts
+artifacts/
+
 # Python: bytecode, caches, coverage, packaging
 __pycache__/
 *.py[cod]

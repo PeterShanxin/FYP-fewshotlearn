@@ -21,6 +21,24 @@ import yaml
 import numpy as np
 from datetime import datetime
 
+# Lightweight status logger: append to RUNALL_STATUS_LOG if set
+def _status_log(message: str) -> None:
+    path = os.environ.get("RUNALL_STATUS_LOG")
+    if not path:
+        return
+    try:
+        tzname = os.environ.get("RUNALL_TZ", "Asia/Singapore")
+        try:
+            from zoneinfo import ZoneInfo  # Python 3.9+
+            ts = datetime.now(ZoneInfo(tzname)).strftime("%Y-%m-%dT%H:%M:%S %Z")
+        except Exception:
+            ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"{ts} {message}\n")
+    except Exception:
+        # best-effort; never fail the run because logging failed
+        pass
+
 
 def run(cmd: List[str]) -> None:
     subprocess.run(cmd, check=True)
@@ -128,9 +146,12 @@ def main() -> None:
             base = emb_base[:-4] if emb_base.endswith('.npz') else emb_base
             Xp = Path(base + ".X.npy")
             Kp = Path(base + ".keys.npy")
-            if args.force_embed or not (Xp.exists() and Kp.exists()):
+            need_embed = bool(args.force_embed or not (Xp.exists() and Kp.exists()))
+            if need_embed:
+                _status_log(f"phase=embed cutoff={pct} fold={fi+1} event=start")
                 try:
                     run(["python", "-m", "src.embed_sequences", "-c", str(cfg_path)])
+                    _status_log(f"phase=embed cutoff={pct} fold={fi+1} event=finish status=success")
                 except subprocess.CalledProcessError:
                     # Fallback: generate synthetic embeddings for union of split accessions
                     print("[benchmark] Embedding step failed; generating synthetic embeddings for smoke")
@@ -155,16 +176,39 @@ def main() -> None:
                     _np.save(Xp, X)
                     _np.save(Kp, _np.array(keys, dtype="U"))
                     print(f"[benchmark] Wrote synthetic embeddings: N={len(keys)} D={D} → {Xp}, {Kp}")
-            run(["python", "-m", "src.train_protonet", "-c", str(cfg_path)])
+                    _status_log(
+                        f"phase=embed cutoff={pct} fold={fi+1} event=finish status=fallback_synthetic N={len(keys)} D={D}"
+                    )
+            else:
+                _status_log(f"phase=embed cutoff={pct} fold={fi+1} event=skip reason=exists")
+            _status_log(f"phase=train cutoff={pct} fold={fi+1} event=start")
+            try:
+                run(["python", "-m", "src.train_protonet", "-c", str(cfg_path)])
+                _status_log(f"phase=train cutoff={pct} fold={fi+1} event=finish status=success")
+            except subprocess.CalledProcessError as e:
+                _status_log(
+                    f"phase=train cutoff={pct} fold={fi+1} event=finish status=failed exit_code={getattr(e, 'returncode', 'NA')}"
+                )
+                raise
             if proto_path is not None:
-                run([
-                    "python",
-                    "scripts/build_prototypes.py",
-                    "--config",
-                    str(cfg_path),
-                    "--out",
-                    str(proto_path),
-                ])
+                _status_log(f"phase=prototypes cutoff={pct} fold={fi+1} event=start")
+                try:
+                    run([
+                        "python",
+                        "scripts/build_prototypes.py",
+                        "--config",
+                        str(cfg_path),
+                        "--out",
+                        str(proto_path),
+                    ])
+                    _status_log(
+                        f"phase=prototypes cutoff={pct} fold={fi+1} event=finish status=success path={proto_path}"
+                    )
+                except subprocess.CalledProcessError as e:
+                    _status_log(
+                        f"phase=prototypes cutoff={pct} fold={fi+1} event=finish status=failed exit_code={getattr(e, 'returncode', 'NA')}"
+                    )
+                    raise
             # Skip eval if test split has no classes
             test_jsonl = Path(run_cfg["paths"]["splits_dir"]) / "test.jsonl"
             nonempty = False
@@ -237,6 +281,9 @@ def main() -> None:
                         print(
                             f"[benchmark][skip] mode=episodic cutoff={pct} fold={fi+1}: {episodic_skip_reason}"
                         )
+                        _status_log(
+                            f"phase=eval cutoff={pct} fold={fi+1} mode=episodic event=skip reason={episodic_skip_reason.replace(' ', '_')}"
+                        )
                         if metrics_path.exists():
                             try:
                                 metrics_path.unlink()
@@ -244,8 +291,19 @@ def main() -> None:
                                 pass
                         continue
                     print(f"[benchmark][eval] mode={label} cutoff={pct} fold={fi+1}")
-                    run(cmd)
+                    _status_log(f"phase=eval cutoff={pct} fold={fi+1} mode={label} event=start")
+                    try:
+                        run(cmd)
+                        _status_log(f"phase=eval cutoff={pct} fold={fi+1} mode={label} event=finish status=success")
+                    except subprocess.CalledProcessError as e:
+                        _status_log(
+                            f"phase=eval cutoff={pct} fold={fi+1} mode={label} event=finish status=failed exit_code={getattr(e, 'returncode', 'NA')}"
+                        )
+                        raise
             else:
+                _status_log(
+                    f"phase=eval cutoff={pct} fold={fi+1} event=skip reason=test_split_empty"
+                )
                 metrics_path.parent.mkdir(parents=True, exist_ok=True)
                 if run_episodic:
                     with open(metrics_path, "w", encoding="utf-8") as f:

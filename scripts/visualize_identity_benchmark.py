@@ -181,13 +181,14 @@ def single_boxplot(ax, thresholds: List[int], data: Dict[int, List[float]], labe
     ax.legend([bp["boxes"][0]], [label], loc="best")
 
 
-def plot_single_bar(ax, x_label: str, mean: float, ci95: float, *, color: str, title: str, ylabel: str, ylim: tuple[float, float] | None = None):
+def plot_single_bar(ax, x_label: str, mean: float, ci95: float, *, color: str, title: str | None, ylabel: str, ylim: tuple[float, float] | None = None):
     # Draw a single bar with symmetric 95% CI error bar
     xs = [x_label]
     vals = [mean]
     errs = [ci95]
     ax.bar(xs, vals, yerr=errs, color=color, alpha=0.85, capsize=6)
-    ax.set_title(title)
+    if title:
+        ax.set_title(title)
     ax.set_ylabel(ylabel)
     if ylim is not None:
         ax.set_ylim(*ylim)
@@ -217,6 +218,7 @@ def main() -> None:
     ap.add_argument("--dpi", type=int, default=150)
     ap.add_argument("--no-pdf", action="store_true", help="Disable generating a bundled PDF report")
     ap.add_argument("--pdf_path", default=None, help="Override PDF output path (default: out_dir/identity_benchmark_report.pdf)")
+    ap.add_argument("--K", type=int, default=None, help="Episodic K to visualize; auto-detect if omitted")
     args = ap.parse_args()
 
     results_dir = Path(args.results_dir)
@@ -230,6 +232,71 @@ def main() -> None:
     summary = load_summary(summary_path)
     thresholds = list_thresholds(summary)
 
+    # Determine which episodic K to use
+    def _available_Ks_from_summary(s: Dict) -> List[int]:
+        ks: List[int] = []
+        for t in list_thresholds(s):
+            epi = s.get(str(t), {}).get("aggregate", {}).get("episodic", {})
+            for key in epi.keys():
+                if isinstance(key, str) and key.startswith("K="):
+                    try:
+                        kint = int(key.split("=", 1)[1])
+                        if kint not in ks:
+                            ks.append(kint)
+                    except Exception:
+                        pass
+        ks.sort()
+        return ks
+
+    available_Ks = _available_Ks_from_summary(summary)
+
+    def _read_K_from_cfg(cfg_path: Path) -> int | None:
+        try:
+            import yaml  # type: ignore
+        except Exception:
+            return None
+        if not cfg_path.exists():
+            return None
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+        except Exception:
+            return None
+        epi = cfg.get("episode", {}) or {}
+        # Prefer K_eval if present
+        k_eval = epi.get("K_eval")
+        if isinstance(k_eval, list) and k_eval:
+            try:
+                return int(k_eval[0])
+            except Exception:
+                pass
+        if isinstance(k_eval, int):
+            return int(k_eval)
+        # Fallback to K_val
+        k_val = epi.get("K_val")
+        if isinstance(k_val, int):
+            return int(k_val)
+        try:
+            return int(k_val) if k_val is not None else None
+        except Exception:
+            return None
+
+    # 1) CLI override
+    chosen_K: int | None = args.K if isinstance(args.K, int) else None
+    # 2) Try last run's config
+    if chosen_K is None:
+        last_cfg = results_dir / "lastrun" / "config.yaml"
+        chosen_K = _read_K_from_cfg(last_cfg)
+    # 3) If not in available, fallback to available set
+    if available_Ks:
+        if chosen_K is None or chosen_K not in available_Ks:
+            # Use the only or the smallest available K
+            chosen_K = available_Ks[0]
+    # Final guard
+    chosen_K = int(chosen_K or 1)
+    K_key = f"K={chosen_K}"
+    K_label_str = f"K={chosen_K}"
+
     plt = _try_import_matplotlib()
     from matplotlib.backends.backend_pdf import PdfPages
 
@@ -237,11 +304,11 @@ def main() -> None:
     is_multi = len(thresholds) >= 2
     single_label = str(thresholds[0]) if thresholds else "NA"
 
-    # 1) Top-1 accuracy vs threshold (K=1)
-    ths, acc_vals, acc_ci = extract_metric(summary, "acc_top1_hit", "K=1")
+    # 1) Top-1 accuracy vs threshold (episodic, chosen K)
+    ths, acc_vals, acc_ci = extract_metric(summary, "acc_top1_hit", K_key)
     fig, ax = plt.subplots(figsize=(7, 4))
     if is_multi:
-        plotted = plot_line_with_ci(ax, ths, acc_vals, acc_ci, label="K=1", color="#4C78A8")
+        plotted = plot_line_with_ci(ax, ths, acc_vals, acc_ci, label=K_label_str, color="#4C78A8")
         ax.set_title("Top-1 Accuracy vs. Identity Threshold")
         ax.set_xlabel("Identity threshold (%)")
         ax.set_ylabel("Accuracy (mean ± 95% CI)")
@@ -266,11 +333,11 @@ def main() -> None:
     fig.savefig(out_dir / "accuracy_vs_threshold.png", dpi=args.dpi)
     figs.append(fig)
 
-    # 2) Macro-F1 vs threshold (K=1)
-    ths, macro_f1, macro_f1_ci = extract_metric(summary, "macro_f1", "K=1")
+    # 2) Macro-F1 vs threshold (episodic, chosen K)
+    ths, macro_f1, macro_f1_ci = extract_metric(summary, "macro_f1", K_key)
     fig, ax = plt.subplots(figsize=(7, 4))
     if is_multi:
-        plotted = plot_line_with_ci(ax, ths, macro_f1, macro_f1_ci, label="Macro-F1 K=1", color="#4C78A8")
+        plotted = plot_line_with_ci(ax, ths, macro_f1, macro_f1_ci, label=f"Macro-F1 {K_label_str}", color="#4C78A8")
         ax.set_title("Macro-F1 vs. Identity Threshold")
         ax.set_xlabel("Identity threshold (%)")
         ax.set_ylabel("Macro-F1 (mean ± 95% CI)")
@@ -293,11 +360,11 @@ def main() -> None:
     fig.savefig(out_dir / "macro_f1_vs_threshold.png", dpi=args.dpi)
     figs.append(fig)
 
-    # 3) Micro-F1 vs threshold (K=1)
-    ths, micro_f1, micro_f1_ci = extract_metric(summary, "micro_f1", "K=1")
+    # 3) Micro-F1 vs threshold (episodic, chosen K)
+    ths, micro_f1, micro_f1_ci = extract_metric(summary, "micro_f1", K_key)
     fig, ax = plt.subplots(figsize=(7, 4))
     if is_multi:
-        plotted = plot_line_with_ci(ax, ths, micro_f1, micro_f1_ci, label="Micro-F1 K=1", color="#4C78A8")
+        plotted = plot_line_with_ci(ax, ths, micro_f1, micro_f1_ci, label=f"Micro-F1 {K_label_str}", color="#4C78A8")
         ax.set_title("Micro-F1 vs. Identity Threshold")
         ax.set_xlabel("Identity threshold (%)")
         ax.set_ylabel("Micro-F1 (mean ± 95% CI)")
@@ -339,6 +406,15 @@ def main() -> None:
             if plotted_any:
                 ax.legend()
         else:
+            # Single-threshold: avoid overlapping titles when using twinx
+            title_primary = None
+            if has_micro and has_macro:
+                title_primary = f"Global Support F1 @ {single_label}%"
+            elif has_micro:
+                title_primary = f"Global Micro-F1 @ {single_label}%"
+            elif has_macro:
+                title_primary = f"Global Macro-F1 @ {single_label}%"
+
             if has_micro:
                 plot_single_bar(
                     ax,
@@ -346,7 +422,7 @@ def main() -> None:
                     mean=(g_micro[0] if g_micro else float("nan")),
                     ci95=(g_micro_ci[0] if g_micro_ci else 0.0),
                     color="#54A24B",
-                    title=f"Global Micro-F1 @ {single_label}%",
+                    title=title_primary if not has_macro else None,
                     ylabel="F1 (mean ± 95% CI)",
                 )
             if has_macro:
@@ -357,11 +433,11 @@ def main() -> None:
                     mean=(g_macro[0] if g_macro else float("nan")),
                     ci95=(g_macro_ci[0] if g_macro_ci else 0.0),
                     color="#E45756",
-                    title=(f"Global Macro-F1 @ {single_label}%" if not has_micro else ax.get_title()),
+                    title=None if has_micro else title_primary,
                     ylabel="F1 (mean ± 95% CI)",
                 )
-                if has_micro:
-                    ax.set_title(f"Global Support F1 @ {single_label}%")
+            if has_micro and has_macro:
+                ax.set_title(title_primary)
         fig.tight_layout()
         fig.savefig(out_dir / "global_f1_vs_threshold.png", dpi=args.dpi)
         figs.append(fig)
@@ -392,11 +468,11 @@ def main() -> None:
         fig.savefig(out_dir / "global_top1_vs_threshold.png", dpi=args.dpi)
         figs.append(fig)
 
-    # 5) Precision and Recall vs threshold (K=1)
-    ths, macro_precision, macro_precision_ci = extract_metric(summary, "macro_precision", "K=1")
+    # 5) Precision and Recall vs threshold (episodic, chosen K)
+    ths, macro_precision, macro_precision_ci = extract_metric(summary, "macro_precision", K_key)
     fig, ax = plt.subplots(figsize=(7, 4))
     if is_multi:
-        plotted = plot_line_with_ci(ax, ths, macro_precision, macro_precision_ci, label="Macro-Precision K=1", color="#4C78A8")
+        plotted = plot_line_with_ci(ax, ths, macro_precision, macro_precision_ci, label=f"Macro-Precision {K_label_str}", color="#4C78A8")
         ax.set_title("Macro-Precision vs. Identity Threshold")
         ax.set_xlabel("Identity threshold (%)")
         ax.set_ylabel("Macro-Precision (mean ± 95% CI)")
@@ -446,10 +522,10 @@ def main() -> None:
         fig.savefig(out_dir / "global_coverage_vs_threshold.png", dpi=args.dpi)
         figs.append(fig)
 
-    ths, macro_recall, macro_recall_ci = extract_metric(summary, "macro_recall", "K=1")
+    ths, macro_recall, macro_recall_ci = extract_metric(summary, "macro_recall", K_key)
     fig, ax = plt.subplots(figsize=(7, 4))
     if is_multi:
-        plotted = plot_line_with_ci(ax, ths, macro_recall, macro_recall_ci, label="Macro-Recall K=1", color="#4C78A8")
+        plotted = plot_line_with_ci(ax, ths, macro_recall, macro_recall_ci, label=f"Macro-Recall {K_label_str}", color="#4C78A8")
         ax.set_title("Macro-Recall vs. Identity Threshold")
         ax.set_xlabel("Identity threshold (%)")
         ax.set_ylabel("Macro-Recall (mean ± 95% CI)")
@@ -492,14 +568,14 @@ def main() -> None:
     figs.append(fig)
 
     # 7) Per-fold accuracy distribution (boxplots)
-    per_fold_acc = collect_per_fold_metric(results_dir, thresholds, "acc_top1_hit", "K=1")
+    per_fold_acc = collect_per_fold_metric(results_dir, thresholds, "acc_top1_hit", K_key)
     fig, ax = plt.subplots(figsize=(8, 4))
-    single_boxplot(ax, thresholds, per_fold_acc, label="K=1", color="#4C78A8")
+    single_boxplot(ax, thresholds, per_fold_acc, label=K_label_str, color="#4C78A8")
     if is_multi:
-        ax.set_title("Per-fold Top-1 Accuracy by Threshold (K=1)")
+        ax.set_title(f"Per-fold Top-1 Accuracy by Threshold ({K_label_str})")
         ax.set_xlabel("Identity threshold (%)")
     else:
-        ax.set_title(f"Per-fold Top-1 Accuracy (K=1 @ {single_label}%)")
+        ax.set_title(f"Per-fold Top-1 Accuracy ({K_label_str} @ {single_label}%)")
     ax.set_ylabel("Accuracy")
     ax.set_ylim(0.0, 1.05)
     ax.grid(True, axis="y", alpha=0.3)
@@ -530,7 +606,7 @@ def main() -> None:
             f"(min {fmt.format(arr.min())}, max {fmt.format(arr.max())})"
         )
 
-    print("\n[visualize] Summary:" + (" (K=1, means across thresholds)" if is_multi else f" (K=1 @ {single_label}%)"))
+    print("\n[visualize] Summary:" + (f" ({K_label_str}, means across thresholds)" if is_multi else f" ({K_label_str} @ {single_label}%)"))
     if is_multi:
         s_acc = describe_single("Top-1 accuracy", acc_vals)
         s_macro = describe_single("Macro-F1", macro_f1)

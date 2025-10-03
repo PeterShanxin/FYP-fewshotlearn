@@ -129,52 +129,22 @@ def main() -> None:
         import esm  # noqa: WPS433
     except ImportError as e:  # pragma: no cover
         raise SystemExit(
-            "[embed] ERROR: Can't import 'esm'. Install the correct package with 'pip install fair-esm'."
+            "[embed] ERROR: Can't import 'esm'. Install with 'pip install fair-esm'."
         ) from e
 
     model_name = cfg["embedding"]["model"]
     print(f"[embed] loading {model_name} …")
-    if hasattr(esm, "pretrained"):
-        model, alphabet = getattr(esm.pretrained, model_name)()
-    else:
-        # Manual construction path (since namespace package lacks pretrained helper)
-        if model_name != "esm2_t12_35M_UR50D":
-            raise SystemExit(
-                "[embed] ERROR: 'esm.pretrained' missing and manual fallback only implemented for esm2_t12_35M_UR50D."
-            )
-        try:
-            from esm.model import esm2
-        except Exception as e:  # pragma: no cover
-            raise SystemExit("[embed] ERROR: Could not import esm.model.esm2 for manual fallback") from e
-        # Architecture index for t12_35M is 12 (layer count). Hidden size inferred internally.
-        model = esm2.ESM2(n_layers=12, embed_dim=480, attention_heads=20)  # values per published spec
-        # Build minimal Alphabet equivalent (FAIR ESM normally supplies). We'll approximate using tokens from model.esm2.
-        # Simpler: require fair-esm instead of reconstructing; but provide emergency path.
-        class _Alphabet:
-            def __init__(self):
-                standard_toks = list("ACDEFGHIKLMNPQRSTVWY")
-                self.padding_idx = 0
-                self.cls_idx = 1
-                self.eos_idx = 2
-                self.toks = ["<pad>", "<cls>", "<eos>"] + standard_toks
-                self._tok_to_int = {t: i for i, t in enumerate(self.toks)}
-
-            def get_batch_converter(self):  # minimal batch converter
-                def convert(pairs):
-                    batch_size = len(pairs)
-                    max_len = max(len(seq) for _, seq in pairs)
-                    import torch
-                    tokens = torch.full((batch_size, max_len + 2), self.padding_idx, dtype=torch.long)
-                    for i, (name, seq) in enumerate(pairs):
-                        tokens[i,0] = self.cls_idx
-                        for j, ch in enumerate(seq):
-                            tokens[i, j+1] = self._tok_to_int.get(ch, self.padding_idx)
-                        tokens[i, len(seq)+1] = self.eos_idx
-                    return None, [p[0] for p in pairs], tokens
-                return convert
-
-        alphabet = _Alphabet()
-        print("[embed] WARNING: Using fallback ESM2 construction without pretrained weights (random init). Install fair-esm for real embeddings.")
+    # Require official pretrained loader; do not attempt manual fallbacks
+    if not hasattr(esm, "pretrained"):
+        raise SystemExit(
+            "[embed] ERROR: esm.pretrained is unavailable. Ensure fair-esm>=2.0.0 is installed."
+        )
+    if not hasattr(esm.pretrained, model_name):
+        raise SystemExit(
+            f"[embed] ERROR: model '{model_name}' not found in esm.pretrained. "
+            "Check your config and installed fair-esm version."
+        )
+    model, alphabet = getattr(esm.pretrained, model_name)()
     model.eval()
     # Prepare device(s)
     multi_gpu = (device.type == "cuda" and torch.cuda.device_count() > 1 and requested_gpus > 1)

@@ -103,6 +103,8 @@ def main() -> None:
     except Exception:
         git_commit = None
 
+    force_embed_paths_done: set[str] = set()
+
     for cut in cutoffs:
         pct = int(round(cut * 100))
         per_fold_metrics: List[Dict[str, Any]] = []
@@ -146,12 +148,24 @@ def main() -> None:
             base = emb_base[:-4] if emb_base.endswith('.npz') else emb_base
             Xp = Path(base + ".X.npy")
             Kp = Path(base + ".keys.npy")
-            need_embed = bool(args.force_embed or not (Xp.exists() and Kp.exists()))
+            files_exist = Xp.exists() and Kp.exists()
+            skip_reason: Optional[str] = None
+            if args.force_embed:
+                need_embed = base not in force_embed_paths_done or not files_exist
+                if not need_embed and files_exist:
+                    skip_reason = "force_reuse"
+            else:
+                need_embed = not files_exist
+                if not need_embed:
+                    skip_reason = "exists"
+
             if need_embed:
                 _status_log(f"phase=embed cutoff={pct} fold={fi+1} event=start")
                 try:
                     run(["python", "-m", "src.embed_sequences", "-c", str(cfg_path)])
                     _status_log(f"phase=embed cutoff={pct} fold={fi+1} event=finish status=success")
+                    if args.force_embed:
+                        force_embed_paths_done.add(base)
                 except subprocess.CalledProcessError:
                     # Fallback: generate synthetic embeddings for union of split accessions
                     print("[benchmark] Embedding step failed; generating synthetic embeddings for smoke")
@@ -179,8 +193,13 @@ def main() -> None:
                     _status_log(
                         f"phase=embed cutoff={pct} fold={fi+1} event=finish status=fallback_synthetic N={len(keys)} D={D}"
                     )
+                    if args.force_embed:
+                        force_embed_paths_done.add(base)
             else:
-                _status_log(f"phase=embed cutoff={pct} fold={fi+1} event=skip reason=exists")
+                reason = skip_reason or ("missing" if files_exist else "unknown")
+                _status_log(
+                    f"phase=embed cutoff={pct} fold={fi+1} event=skip reason={reason}"
+                )
             _status_log(f"phase=train cutoff={pct} fold={fi+1} event=start")
             try:
                 run(["python", "-m", "src.train_protonet", "-c", str(cfg_path)])

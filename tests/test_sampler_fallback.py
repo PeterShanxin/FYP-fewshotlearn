@@ -4,7 +4,6 @@ import json
 from pathlib import Path
 
 import numpy as np
-import pytest
 import torch
 
 from src.episodic_sampler import EpisodeSampler
@@ -24,7 +23,7 @@ def _write_split(path: Path, entries: list[dict[str, object]]) -> None:
             handle.write(json.dumps(entry) + "\n")
 
 
-def test_fallback_applies_only_during_training(tmp_path: Path) -> None:
+def test_fallback_applies_in_train_and_eval(tmp_path: Path) -> None:
     base = tmp_path / "embeddings"
     keys = ["a1", "a2"]
     vectors = [[1.0, 0.0], [0.0, 1.0]]
@@ -69,6 +68,61 @@ def test_fallback_applies_only_during_training(tmp_path: Path) -> None:
         sequence_lookup=seq_lookup,
     )
 
-    with pytest.raises(RuntimeError):
-        val_sampler.sample_episode(M=1, K=2, Q=2)
+    sx, sy, qx, qy, classes_val = val_sampler.sample_episode(M=1, K=2, Q=2)
+
+    assert classes_val == ["A"]
+    assert sx.shape[0] == 2
+    assert qx.shape[0] == 2
+    assert val_sampler.fallback_events == 1
+    assert val_sampler.fallback_per_ec["A"] == 1
+    assert val_sampler.last_pick_stats["selected_underfilled"] == 1
+
+
+def test_val_sampler_reports_tail_coverage(tmp_path: Path) -> None:
+    base = tmp_path / "embeddings"
+    keys = ["a1", "a2", "a3", "b1"]
+    vectors = [
+        [1.0, 0.0],
+        [0.0, 1.0],
+        [1.0, 1.0],
+        [0.5, 0.5],
+    ]
+    _write_embeddings(base, keys, vectors)
+
+    split_path = tmp_path / "val.jsonl"
+    _write_split(
+        split_path,
+        [
+            {"ec": "A", "accessions": ["a1", "a2", "a3"]},
+            {"ec": "B", "accessions": ["b1"]},
+        ],
+    )
+
+    val_sampler = EpisodeSampler(
+        base,
+        split_path,
+        torch.device("cpu"),
+        seed=11,
+        phase="val",
+        multi_label=False,
+        with_replacement_fallback=False,
+    )
+
+    coverage = val_sampler.class_coverage(K=1, Q=2)
+    assert coverage == {
+        "total_classes": 2,
+        "eligible_full": 1,
+        "eligible_support_only": 1,
+        "excluded": 0,
+    }
+
+    sx, sy, qx, qy, classes = val_sampler.sample_episode(M=2, K=1, Q=2)
+
+    assert set(classes) == {"A", "B"}
+    assert sx.shape[0] == 2
+    assert qx.shape[0] == 4
+    assert val_sampler.fallback_per_ec["B"] == 1
+    stats = val_sampler.last_pick_stats
+    assert stats["selected_underfilled"] == 1
+    assert stats["total_classes"] == 2
 

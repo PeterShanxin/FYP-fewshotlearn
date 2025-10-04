@@ -90,6 +90,22 @@ def episodic_accuracy(
 ) -> float:
     correct = 0
     total = 0
+    coverage = val_sampler.class_coverage(K, Q)
+    print(
+        "[val][coverage] classes with ≥K+Q: {full}/{total} | tail (≥K,<K+Q): {tail} | excluded: {excluded}".format(
+            full=coverage["eligible_full"],
+            total=coverage["total_classes"],
+            tail=coverage["eligible_support_only"],
+            excluded=coverage["excluded"],
+        )
+    )
+    if coverage["eligible_full"] < M:
+        print(
+            "[val][coverage] WARNING: only {full} classes can fill support+query without fallback; requesting M={M}".format(
+                full=coverage["eligible_full"],
+                M=M,
+            )
+        )
     with torch.no_grad():
         with evaluating(model):
             for _ in trange(

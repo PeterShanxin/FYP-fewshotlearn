@@ -53,6 +53,22 @@ def eval_for_K(
     y_pred_ml: List[np.ndarray] = []
     tau_multi = float(tau_multi)
     thresholds_map = per_ec_thresholds or {}
+    coverage = sampler.class_coverage(K, Q)
+    print(
+        "[eval][coverage] classes with ≥K+Q: {full}/{total} | tail (≥K,<K+Q): {tail} | excluded: {excluded}".format(
+            full=coverage["eligible_full"],
+            total=coverage["total_classes"],
+            tail=coverage["eligible_support_only"],
+            excluded=coverage["excluded"],
+        )
+    )
+    if coverage["eligible_full"] < M:
+        print(
+            "[eval][coverage] WARNING: only {full} classes can fill support+query without fallback; requesting M={M}".format(
+                full=coverage["eligible_full"],
+                M=M,
+            )
+        )
     with torch.no_grad():
         for _ in trange(
             episodes,

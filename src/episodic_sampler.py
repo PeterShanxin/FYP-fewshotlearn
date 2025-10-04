@@ -100,6 +100,7 @@ class EpisodeSampler:
         self._np_rng = np.random.default_rng(seed)
         self.multi_label = bool(multi_label)
         self.disjoint_support_query = bool(disjoint_support_query)
+        self._eval_tail_fallback = self.phase in {"val", "test"}
 
         fallback_scope_norm = (fallback_scope or "train_only").lower().strip()
         if fallback_scope_norm not in {"train_only", "all", "none"}:
@@ -185,6 +186,8 @@ class EpisodeSampler:
         self.fallback_events = 0
         self._stats_dirty = False
         self.usage_log_path = (usage_log_dir / "sampler_stats.csv") if usage_log_dir else None
+        self._current_underfilled: Set[str] = set()
+        self._last_pick_stats: Dict[str, int] = {}
 
         # Cluster shortage diagnostics (for disjoint support/query sampling)
         self.cluster_shortage_counts: DefaultDict[str, int] = defaultdict(int)
@@ -230,33 +233,69 @@ class EpisodeSampler:
             return 1.0 / denom if denom > 0 else 0.0
         return 1.0
 
-    def _pick_classes(self, M: int, need: int, allow_underfilled: bool) -> List[str]:
-        eligible: List[str] = []
+    def _weighted_sample_classes(self, candidates: List[str], count: int) -> List[str]:
+        if count <= 0:
+            return []
+        if self.rare_class_boost == "inverse_log_freq" and len(candidates) > 0:
+            weights = np.array([self._class_weight(ec) for ec in candidates], dtype=np.float64)
+            total = float(weights.sum())
+            if total > 0:
+                if count >= len(candidates):
+                    chosen = candidates[:]
+                    self.rng.shuffle(chosen)
+                    return chosen
+                probs = weights / total
+                chosen = self._np_rng.choice(candidates, size=count, replace=False, p=probs)
+                return chosen.tolist()
+        pool = candidates[:]
+        self.rng.shuffle(pool)
+        return pool[:count]
+
+    def _pick_classes(self, M: int, need: int, support: int, allow_underfilled: bool) -> List[str]:
+        eligible_full: List[str] = []
+        eligible_support_only: List[str] = []
+        total_classes = 0
         for ec in self.split.classes:
             count = self.class_counts.get(ec, 0)
             if count == 0:
                 continue
-            if count >= need or allow_underfilled:
-                eligible.append(ec)
-        if len(eligible) < M:
-            raise RuntimeError(
-                f"Not enough classes with embeddings: have {len(eligible)}, need {M} (need={need}, allow_underfilled={allow_underfilled})"
-            )
+            total_classes += 1
+            if count >= need:
+                eligible_full.append(ec)
+            elif allow_underfilled and count >= support:
+                eligible_support_only.append(ec)
 
-        if self.rare_class_boost == "inverse_log_freq":
-            weights = np.array([self._class_weight(ec) for ec in eligible], dtype=np.float64)
-            total = float(weights.sum())
-            if total <= 0:
-                pool = eligible[:]
-                self.rng.shuffle(pool)
-                return pool[:M]
-            probs = weights / total
-            chosen = self._np_rng.choice(eligible, size=M, replace=False, p=probs)
-            return chosen.tolist()
+        allow_tail = allow_underfilled
+        candidate_pool: List[str]
+        selected_tail: List[str] = []
+        if len(eligible_full) >= M or not allow_tail:
+            candidate_pool = eligible_full
+            if len(candidate_pool) < M:
+                raise RuntimeError(
+                    f"Not enough classes with embeddings: have {len(candidate_pool)}, need {M} (need={need}, allow_underfilled={allow_underfilled})"
+                )
+            picked = self._weighted_sample_classes(candidate_pool, M)
+        else:
+            needed_tail = M - len(eligible_full)
+            if len(eligible_full) + len(eligible_support_only) < M:
+                raise RuntimeError(
+                    f"Not enough classes with embeddings: have {len(eligible_full) + len(eligible_support_only)}, need {M} (need={need}, allow_underfilled={allow_underfilled})"
+                )
+            picked = self._weighted_sample_classes(eligible_full, len(eligible_full))
+            tail_choices = self._weighted_sample_classes(eligible_support_only, needed_tail)
+            selected_tail = tail_choices[:]
+            picked.extend(tail_choices)
+            self.rng.shuffle(picked)
 
-        pool = eligible[:]
-        self.rng.shuffle(pool)
-        return pool[:M]
+        self._current_underfilled = set(selected_tail)
+        self._last_pick_stats = {
+            "total_classes": total_classes,
+            "eligible_full": len(eligible_full),
+            "eligible_support_only": len(eligible_support_only),
+            "selected_total": len(picked),
+            "selected_underfilled": len(selected_tail),
+        }
+        return picked
 
     def _clusters_for(self, pool_idx: List[int]) -> Dict[str, List[int]]:
         clusters: DefaultDict[str, List[int]] = defaultdict(list)
@@ -548,3 +587,32 @@ class EpisodeSampler:
         self._stats_dirty = False
         print(f"[sampler] wrote usage stats → {out_path}")
         return out_path
+
+    def class_coverage(self, K: int, Q: int) -> Dict[str, int]:
+        """Return how many classes have sufficient samples for (K, Q)."""
+
+        need = K + Q
+        total = 0
+        eligible_full = 0
+        eligible_support_only = 0
+        for ec in self.split.classes:
+            count = self.class_counts.get(ec, 0)
+            if count <= 0:
+                continue
+            total += 1
+            if count >= need:
+                eligible_full += 1
+            elif count >= K:
+                eligible_support_only += 1
+        return {
+            "total_classes": total,
+            "eligible_full": eligible_full,
+            "eligible_support_only": eligible_support_only,
+            "excluded": max(total - eligible_full - eligible_support_only, 0),
+        }
+
+    @property
+    def last_pick_stats(self) -> Dict[str, int]:
+        """Return stats from the most recent :meth:`sample_episode` call."""
+
+        return dict(self._last_pick_stats)

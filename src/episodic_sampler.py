@@ -43,6 +43,19 @@ except ImportError:  # pragma: no cover - tqdm is an optional runtime dep
 from . import augment
 
 
+class ClusterShortageError(RuntimeError):
+    """Raised when a class lacks enough clusters for disjoint sampling."""
+
+    def __init__(self, ec: str, have: int, need: int) -> None:
+        super().__init__(
+            f"Class {ec} has only {have} clusters available but requires {need} "
+            "for disjoint support/query sampling."
+        )
+        self.ec = ec
+        self.have = have
+        self.need = need
+
+
 @dataclass
 class SplitIndex:
     """Index of EC classes to accession lists."""
@@ -173,6 +186,13 @@ class EpisodeSampler:
         self._stats_dirty = False
         self.usage_log_path = (usage_log_dir / "sampler_stats.csv") if usage_log_dir else None
 
+        # Cluster shortage diagnostics (for disjoint support/query sampling)
+        self.cluster_shortage_counts: DefaultDict[str, int] = defaultdict(int)
+        self.cluster_shortage_events = 0
+        self.cluster_shortage_dropped_episodes = 0
+        self.cluster_shortage_last_drop: Dict[str, int] = {}
+        self._max_cluster_resample_attempts = 10
+
         # View augmentation hyper-parameters
         self._view_dropout = 0.08
         self._view_noise_sigma = 0.01
@@ -256,28 +276,12 @@ class EpisodeSampler:
             clusters = self._clusters_for(pool_idx)
             cids = list(clusters.keys())
             self.rng.shuffle(cids)
-            support_idx: List[int] = []
-            used_cids: List[str] = []
-            for i in range(K):
-                cid = cids[i % len(cids)]
-                support_idx.append(self.rng.choice(clusters[cid]))
-                if cid not in used_cids:
-                    used_cids.append(cid)
-            remaining_cids = [c for c in cids if c not in used_cids]
-            query_idx: List[int] = []
-            if remaining_cids:
-                self.rng.shuffle(remaining_cids)
-                for i in range(Q):
-                    cid = remaining_cids[i % len(remaining_cids)]
-                    query_idx.append(self.rng.choice(clusters[cid]))
-            else:
-                pool_no_support = [idx for idx in pool_idx if idx not in support_idx]
-                for _ in range(Q):
-                    if pool_no_support:
-                        choice = pool_no_support.pop()
-                    else:
-                        choice = self.rng.choice(pool_idx)
-                    query_idx.append(choice)
+            if len(cids) < need:
+                raise ClusterShortageError(ec, len(cids), need)
+            support_cids = cids[:K]
+            query_cids = cids[K : K + Q]
+            support_idx = [self.rng.choice(clusters[cid]) for cid in support_cids]
+            query_idx = [self.rng.choice(clusters[cid]) for cid in query_cids]
         else:
             chosen = self.rng.sample(pool_idx, need)
             support_idx = chosen[:K]
@@ -295,25 +299,13 @@ class EpisodeSampler:
                 # fall back to plain behaviour
                 return self._sample_with_replacement_plain(pool_idx, K, Q)
             self.rng.shuffle(cids)
-            support_idx: List[int] = []
-            support_cids: List[str] = []
-            for _ in range(K):
-                cid = cids.pop(0) if cids else self.rng.choice(list(clusters.keys()))
-                support_idx.append(self.rng.choice(clusters[cid]))
-                support_cids.append(cid)
-                if cid not in cids:
-                    cids.append(cid)  # allow reuse when not enough clusters
-            remaining_cids = [cid for cid in clusters.keys() if cid not in support_cids]
-            self.rng.shuffle(remaining_cids)
-            query_idx: List[int] = []
-            while len(query_idx) < Q:
-                if remaining_cids:
-                    cid = remaining_cids.pop(0)
-                else:
-                    cid = self.rng.choice(list(clusters.keys()))
-                query_idx.append(self.rng.choice(clusters[cid]))
-                if cid not in remaining_cids and len(remaining_cids) + len(query_idx) < Q:
-                    remaining_cids.append(cid)
+            need = K + Q
+            if len(cids) < need:
+                raise ClusterShortageError(ec, len(cids), need)
+            support_cids = cids[:K]
+            query_cids = cids[K : K + Q]
+            support_idx = [self.rng.choice(clusters[cid]) for cid in support_cids]
+            query_idx = [self.rng.choice(clusters[cid]) for cid in query_cids]
             return support_idx, query_idx
 
         return self._sample_with_replacement_plain(pool_idx, K, Q)
@@ -402,6 +394,15 @@ class EpisodeSampler:
             cache[idx] = views
         return views[pos]
 
+    def _record_cluster_shortage(self, ec: str, have: int, need: int) -> None:
+        self.cluster_shortage_counts[ec] += 1
+        self.cluster_shortage_events += 1
+        if self.cluster_shortage_events <= 5 or self.cluster_shortage_events % 50 == 0:
+            _progress_write(
+                f"[sampler][{self.phase}] cluster shortage for EC {ec}: "
+                f"clusters={have}, need={need}"
+            )
+
     def _log_fallback(self, ec: str, have: int, need: int) -> None:
         self.fallback_events += 1
         if self.fallback_events <= 5 or self.fallback_events % 50 == 0:
@@ -410,21 +411,14 @@ class EpisodeSampler:
                 f"available={have}, need={need}"
             )
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-    def sample_episode(
+    def _build_episode(
         self,
-        M: int,
+        classes: List[str],
         K: int,
         Q: int,
+        need: int,
+        allow_underfilled: bool,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, List[str]]:
-        if K <= 0 or Q <= 0:
-            raise ValueError("K and Q must be positive integers")
-        need = K + Q
-        allow_underfilled = self.allow_fallback
-        classes = self._pick_classes(M, need, allow_underfilled)
-
         support_x: List[np.ndarray] = []
         support_y: List[int] = []
         query_x: List[np.ndarray] = []
@@ -438,7 +432,7 @@ class EpisodeSampler:
             if not pool_idx:
                 raise RuntimeError(f"No embeddings for class {ec}")
             count = len(pool_idx)
-            use_fallback = count < need and self.allow_fallback
+            use_fallback = count < need and allow_underfilled
             if use_fallback:
                 s_idx, q_idx = self._sample_with_replacement(ec, pool_idx, K, Q)
                 self._log_fallback(ec, count, need)
@@ -487,6 +481,46 @@ class EpisodeSampler:
         else:
             qy = torch.tensor(query_y, dtype=torch.long, device=self.device)
         return sx, sy, qx, qy, classes
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def sample_episode(
+        self,
+        M: int,
+        K: int,
+        Q: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, List[str]]:
+        if K <= 0 or Q <= 0:
+            raise ValueError("K and Q must be positive integers")
+        need = K + Q
+        allow_underfilled = self.allow_fallback
+        attempts = 0
+        shortage_attempts: DefaultDict[str, int] = defaultdict(int)
+
+        while attempts < self._max_cluster_resample_attempts:
+            attempts += 1
+            classes = self._pick_classes(M, need, allow_underfilled)
+            try:
+                return self._build_episode(classes, K, Q, need, allow_underfilled)
+            except ClusterShortageError as err:
+                shortage_attempts[err.ec] += 1
+                self._record_cluster_shortage(err.ec, err.have, err.need)
+                continue
+
+        self.cluster_shortage_dropped_episodes += 1
+        self.cluster_shortage_last_drop = dict(shortage_attempts)
+        shortage_list = ", ".join(
+            f"{ec} (attempts={cnt})" for ec, cnt in sorted(shortage_attempts.items())
+        )
+        _progress_write(
+            f"[sampler][{self.phase}] dropping episode after {attempts} attempts due to "
+            f"cluster shortages: {shortage_list or 'unknown'}"
+        )
+        raise RuntimeError(
+            "Unable to sample episode with disjoint support/query clusters. "
+            "Adjust K/Q or exclude problematic ECs."
+        )
 
     def write_usage_csv(self, target_dir: Optional[Path] = None) -> Optional[Path]:
         if not self._stats_dirty and target_dir is None and self.usage_log_path is None:

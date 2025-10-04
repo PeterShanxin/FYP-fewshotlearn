@@ -163,6 +163,17 @@ def mmseqs_cluster_components(
         log_file=logs / "mmseqs_createdb.log",
     )
 
+    # mmseqs exits non-zero if the target cluster DB already exists from a
+    # interrupted run; proactively clear leftovers before clustering.
+    for leftover in workdir.glob(f"{clu_name}*"):
+        if leftover.is_dir():
+            shutil.rmtree(leftover, ignore_errors=True)
+        else:
+            try:
+                leftover.unlink()
+            except FileNotFoundError:
+                pass
+
     cluster_cmd = [
         "mmseqs",
         mode,

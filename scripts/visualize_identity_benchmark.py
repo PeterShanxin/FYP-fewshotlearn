@@ -9,8 +9,8 @@ Generates publication-style plots, a bundled PDF report, and prints a quick text
 Usage:
   python scripts/visualize_identity_benchmark.py \
       --results_dir results \
-      --out_dir results/figures \
-      [--no-pdf] [--pdf_path results/figures/identity_benchmark_report.pdf]
+      --out_dir report/graphs \
+      [--no-pdf] [--pdf_path report/identity_benchmark_report.pdf]
 
 Notes:
 - Expects results/summary_by_id_threshold.json and split-XX directories
@@ -214,10 +214,17 @@ def describe_monotonic_trend(values: List[int]) -> str:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--results_dir", default="results", help="Path to results root")
-    ap.add_argument("--out_dir", default="results/figures", help="Where to save figures")
+    DEFAULT_OUT_DIR = Path("report") / "graphs"
+    DEFAULT_PDF_DIR = Path("report")
+
+    ap.add_argument("--out_dir", default=str(DEFAULT_OUT_DIR), help="Where to save figures")
     ap.add_argument("--dpi", type=int, default=150)
     ap.add_argument("--no-pdf", action="store_true", help="Disable generating a bundled PDF report")
-    ap.add_argument("--pdf_path", default=None, help="Override PDF output path (default: out_dir/identity_benchmark_report.pdf)")
+    ap.add_argument(
+        "--pdf_path",
+        default=None,
+        help="Override PDF output path (default: report/identity_benchmark_report.pdf when using the default out_dir)",
+    )
     ap.add_argument("--K", type=int, default=None, help="Episodic K to visualize; auto-detect if omitted")
     args = ap.parse_args()
 
@@ -646,7 +653,11 @@ def main() -> None:
 
     # 9) Optional PDF report bundling: title + summary page + all plots
     if not args.no_pdf:
-        pdf_path = Path(args.pdf_path) if args.pdf_path else (out_dir / "identity_benchmark_report.pdf")
+        if args.pdf_path:
+            pdf_path = Path(args.pdf_path)
+        else:
+            pdf_path = (DEFAULT_PDF_DIR / "identity_benchmark_report.pdf") if out_dir == DEFAULT_OUT_DIR else (out_dir / "identity_benchmark_report.pdf")
+        pdf_path.parent.mkdir(parents=True, exist_ok=True)
         fig_sum = plt.figure(figsize=(8.5, 11))
         fig_sum.subplots_adjust(left=0.08, right=0.92, top=0.92, bottom=0.08)
         fig_sum.suptitle("Identity Benchmark Report", fontsize=16, fontweight="bold", y=0.97)

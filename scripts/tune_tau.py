@@ -112,6 +112,68 @@ def _write_report(path: Path, records: Sequence[Dict[str, object]]) -> None:
             json.dump(list(records), handle, indent=2)
 
 
+def _plot_metric_curves(
+    records: Sequence[Dict[str, object]],
+    out_dir: Path,
+    metrics: Sequence[str],
+    *,
+    xlabel: str = "tau",
+    title_prefix: str = "Tuning curve",
+) -> List[Path]:
+    """Render per-metric curves vs tau, grouped by temperature if present.
+
+    Returns a list of saved figure paths. Silently no-ops if matplotlib is unavailable
+    or there are no records.
+    """
+    paths: List[Path] = []
+    if not records:
+        return paths
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+    except Exception:
+        return paths
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Group points by temperature so we can plot separate series
+    by_temp: Dict[float, List[Tuple[float, Dict[str, float]]]] = {}
+    for r in records:
+        try:
+            t = float(r.get("temperature", 0.0))
+            tau = float(r.get("tau_multi", 0.0))
+        except Exception:
+            continue
+        by_temp.setdefault(t, []).append((tau, {k: float(r.get(k, float("nan"))) for k in metrics}))
+
+    for metric in metrics:
+        plt.figure(figsize=(7, 4))
+        any_series = False
+        for t, pts in sorted(by_temp.items(), key=lambda kv: kv[0]):
+            pts.sort(key=lambda x: x[0])
+            xs = [p[0] for p in pts]
+            ys = [p[1].get(metric, float("nan")) for p in pts]
+            if not xs:
+                continue
+            any_series = True
+            label = f"T={t:.3f}"
+            plt.plot(xs, ys, marker="o", label=label)
+        if not any_series:
+            plt.close()
+            continue
+        plt.xlabel(xlabel)
+        plt.ylabel(metric)
+        plt.title(f"{title_prefix}: {metric} vs {xlabel}")
+        plt.grid(True, alpha=0.3)
+        if len(by_temp) > 1:
+            plt.legend()
+        fig_path = out_dir / f"tau_curve_{metric}.png"
+        plt.tight_layout()
+        plt.savefig(fig_path, dpi=150)
+        plt.close()
+        paths.append(fig_path)
+    return paths
+
+
 def _compute_per_class_thresholds(
     evaluator: GlobalSupportEvaluator,
     *,
@@ -241,6 +303,17 @@ def main() -> None:
     ap.add_argument("--min-precision", type=float, default=None)
     ap.add_argument("--min-recall", type=float, default=None)
     ap.add_argument("--report", type=Path, default=None)
+    ap.add_argument(
+        "--plots-dir",
+        type=Path,
+        default=None,
+        help="Optional directory to save metric-vs-tau plots",
+    )
+    ap.add_argument(
+        "--plot-all",
+        action="store_true",
+        help="If set, generate separate plots for key metrics vs tau",
+    )
     ap.add_argument("--ensure-top1", choices=("true", "false"), default=None, help="Override ensure_top1 from config")
     ap.add_argument(
         "--opt-temp",
@@ -399,6 +472,26 @@ def main() -> None:
 
     if args.report is not None:
         _write_report(args.report, report_records)
+
+    # Optional plotting: per-metric curves vs tau
+    if args.plot_all and report_records:
+        plots_dir = args.plots_dir if args.plots_dir is not None else (args.report.parent if args.report else Path("artifacts"))
+        metric_list = [
+            "micro_f1",
+            "macro_f1",
+            "acc_top1_hit",
+            "micro_precision",
+            "micro_recall",
+        ]
+        saved = _plot_metric_curves(
+            report_records,
+            plots_dir,
+            metric_list,
+            xlabel="tau",
+            title_prefix="Tuning curve",
+        )
+        for p in saved:
+            print(f"Saved plot → {p}")
 
     if args.per_class_out is not None:
         target = args.per_class_target

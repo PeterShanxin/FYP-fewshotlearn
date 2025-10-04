@@ -39,6 +39,7 @@ if str(ROOT) not in sys.path:
 from src.eval_global import GlobalSupportEvaluator, _load_thresholds  # type: ignore
 from src.model_utils import build_model, infer_input_dim, load_checkpoint, load_cfg, pick_device  # type: ignore
 from src.prototype_bank import build_prototypes, save_prototypes, load_prototypes  # type: ignore
+import subprocess
 
 
 MetricKeys = Tuple[str, str, str, str, str]
@@ -277,6 +278,9 @@ def _choose_split_with_coverage(
 def _ensure_prototypes(
     cfg: dict,
     desired_out: Path,
+    *,
+    train_if_missing: bool = False,
+    config_path: Optional[Path] = None,
 ) -> Path:
     """Return a prototype NPZ path, building it if necessary when feasible.
 
@@ -294,10 +298,31 @@ def _ensure_prototypes(
     ckpt_path = outputs_dir / "checkpoints" / "protonet.pt"
     train_split = (Path(splits_dir) / "train.jsonl") if splits_dir else None
 
-    if not (embeddings_path and train_split and ckpt_path.exists()):
+    if not (embeddings_path and train_split):
         raise FileNotFoundError(
-            "Prototypes not found and cannot auto-build (missing embeddings/train split/checkpoint)."
+            "Prototypes not found and cannot auto-build (missing embeddings or train split)."
         )
+
+    # Ensure checkpoint exists; optionally trigger training when requested
+    if not ckpt_path.exists():
+        if not train_if_missing:
+            raise FileNotFoundError(
+                f"Checkpoint not found: {ckpt_path}. Use --train-if-missing to train before tuning."
+            )
+        # Fire training once to produce the checkpoint
+        cfg_path = Path(config_path) if config_path is not None else None
+        if cfg_path is None:
+            raise FileNotFoundError(
+                f"Checkpoint not found and no config provided to run training: {ckpt_path}"
+            )
+        cmd = ["python", "-m", "src.train_protonet", "-c", str(cfg_path)]
+        print(f"[auto_tune_tau] Training model to create checkpoint → {ckpt_path}")
+        try:
+            subprocess.run(cmd, check=True)
+        except subprocess.CalledProcessError as e:
+            raise FileNotFoundError(
+                f"Training failed; cannot create checkpoint for prototypes. Exit code: {getattr(e, 'returncode', 'NA')}"
+            ) from e
 
     device = pick_device(cfg)
     input_dim = infer_input_dim(embeddings_path)
@@ -328,6 +353,67 @@ def _write_report(path: Path, records: Sequence[Dict[str, object]]) -> None:
             writer.writerow(record)
 
 
+def _plot_metric_curves(
+    records: Sequence[Dict[str, object]],
+    out_dir: Path,
+    metrics: Sequence[str],
+    *,
+    xlabel: str = "tau",
+    title_prefix: str = "Tuning curve",
+) -> List[Path]:
+    """Render per-metric curves vs tau, grouped by temperature if present.
+
+    Returns a list of saved figure paths. Silently returns [] if matplotlib is unavailable
+    or there are no records.
+    """
+    paths: List[Path] = []
+    if not records:
+        return paths
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+    except Exception:
+        return paths
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    by_temp: Dict[float, List[Tuple[float, Dict[str, float]]]] = {}
+    for r in records:
+        try:
+            t = float(r.get("temperature", 0.0))
+            tau = float(r.get("tau_multi", 0.0))
+        except Exception:
+            continue
+        by_temp.setdefault(t, []).append((tau, {k: float(r.get(k, float("nan"))) for k in metrics}))
+
+    for metric in metrics:
+        plt.figure(figsize=(7, 4))
+        any_series = False
+        for t, pts in sorted(by_temp.items(), key=lambda kv: kv[0]):
+            pts.sort(key=lambda x: x[0])
+            xs = [p[0] for p in pts]
+            ys = [p[1].get(metric, float("nan")) for p in pts]
+            if not xs:
+                continue
+            any_series = True
+            label = f"T={t:.3f}"
+            plt.plot(xs, ys, marker="o", label=label)
+        if not any_series:
+            plt.close()
+            continue
+        plt.xlabel(xlabel)
+        plt.ylabel(metric)
+        plt.title(f"{title_prefix}: {metric} vs {xlabel}")
+        plt.grid(True, alpha=0.3)
+        if len(by_temp) > 1:
+            plt.legend()
+        fig_path = out_dir / f"tau_curve_{metric}.png"
+        plt.tight_layout()
+        plt.savefig(fig_path, dpi=150)
+        plt.close()
+        paths.append(fig_path)
+    return paths
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Auto-tune tau/temperature for global-support evaluation")
     ap.add_argument("--config", "-c", type=Path, default=Path("config.yaml"))
@@ -356,8 +442,28 @@ def main() -> None:
                     help="If a class has <N positives on the calibration split, fall back to global tau")
     ap.add_argument("--out", type=Path, default=None, help="Calibration JSON output (auto if omitted)")
     ap.add_argument("--report", type=Path, default=None, help="CSV report output (auto if omitted)")
-    ap.add_argument("--plot-metric", choices=("micro_f1", "macro_f1", "acc_top1_hit"), default="micro_f1",
-                    help="Metric to plot in the tuning curve if matplotlib is available")
+    ap.add_argument(
+        "--plots-dir",
+        type=Path,
+        default=None,
+        help="Optional directory to save metric-vs-tau plots (defaults next to report)",
+    )
+    ap.add_argument(
+        "--plot-metric",
+        choices=("micro_f1", "macro_f1", "acc_top1_hit"),
+        default="micro_f1",
+        help="Metric to plot in the single tuning curve when not using --plot-all",
+    )
+    ap.add_argument(
+        "--plot-all",
+        action="store_true",
+        help="If set, generate separate plots for key metrics vs tau",
+    )
+    ap.add_argument(
+        "--train-if-missing",
+        action="store_true",
+        help="If checkpoint/prototypes are missing, train once and build prototypes automatically",
+    )
     args = ap.parse_args()
 
     cfg = load_cfg(args.config)
@@ -375,7 +481,12 @@ def main() -> None:
         p = eval_cfg.get("prototypes_path")
         protos_path = Path(p) if p else Path("artifacts/prototypes.npz")
     try:
-        protos_path = _ensure_prototypes(cfg, protos_path)
+        protos_path = _ensure_prototypes(
+            cfg,
+            protos_path,
+            train_if_missing=bool(args.train_if_missing),
+            config_path=Path(args.config),
+        )
     except FileNotFoundError:
         if not Path(protos_path).exists():
             raise
@@ -552,44 +663,52 @@ def main() -> None:
         # Don't fail tuning just because of printing
         pass
 
-    # Optional plot: tau vs selected metric, grouped by temperature
+    # Optional plots: per-metric curves vs tau
     try:
-        import matplotlib.pyplot as plt  # type: ignore
         if report_records:
-            # collect series
-            by_temp: Dict[float, List[Tuple[float, float]]] = {}
-            for r in report_records:
-                try:
-                    t = float(r.get("temperature", 0.0))
-                    tau = float(r.get("tau_multi", 0.0))
-                    y = float(r.get(args.plot_metric, 0.0))
-                except Exception:
-                    continue
-                by_temp.setdefault(t, []).append((tau, y))
-
-            plt.figure(figsize=(7, 4))
-            for t, pts in sorted(by_temp.items(), key=lambda kv: kv[0]):
-                pts.sort(key=lambda x: x[0])
-                xs = [p[0] for p in pts]
-                ys = [p[1] for p in pts]
-                label = f"T={t:.3f}"
-                plt.plot(xs, ys, marker='o', label=label)
-            plt.xlabel("tau")
-            plt.ylabel(args.plot_metric)
-            plt.title("Tuning curve: tau vs " + args.plot_metric)
-            plt.grid(True, alpha=0.3)
-            if len(by_temp) > 1:
-                plt.legend()
-            fig_path = report_path.with_name("tune_curve.png")
-            plt.tight_layout()
-            fig_path.parent.mkdir(parents=True, exist_ok=True)
-            plt.savefig(fig_path, dpi=150)
-            plt.close()
-            print(f"\nSaved tuning curve → {fig_path}")
+            plots_dir = args.plots_dir if args.plots_dir is not None else report_path.parent
+            if args.plot_all:
+                metric_list = [
+                    "micro_f1",
+                    "macro_f1",
+                    "acc_top1_hit",
+                    "micro_precision",
+                    "micro_recall",
+                ]
+                saved = _plot_metric_curves(
+                    report_records,
+                    plots_dir,
+                    metric_list,
+                    xlabel="tau",
+                    title_prefix="Tuning curve",
+                )
+                for p in saved:
+                    print(f"Saved plot → {p}")
+            else:
+                # Single plot for --plot-metric
+                # Reuse helper by asking it to render just one metric and then rename to legacy name
+                saved = _plot_metric_curves(
+                    report_records,
+                    plots_dir,
+                    [args.plot_metric],
+                    xlabel="tau",
+                    title_prefix="Tuning curve",
+                )
+                if saved:
+                    # Backward-compatible filename
+                    legacy = report_path.with_name("tune_curve.png")
+                    try:
+                        # Copy the plotted figure to legacy path if different dir
+                        if saved[0] != legacy:
+                            import shutil
+                            shutil.copyfile(saved[0], legacy)
+                        print(f"\nSaved tuning curve → {legacy}")
+                    except Exception:
+                        print(f"\nSaved tuning curve → {saved[0]}")
         else:
             print("\nNo report records to plot.")
     except Exception:
-        # Matplotlib may be unavailable in some environments; silently skip.
+        # Matplotlib may be unavailable; silently skip.
         pass
 
     # Optional: per-class thresholds

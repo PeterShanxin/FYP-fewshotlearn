@@ -64,7 +64,7 @@ identity-benchmark:
 
 visualize:
 	@if [ -f results/summary_by_id_threshold.json ]; then \
-		$(PY) scripts/visualize_identity_benchmark.py --results_dir results --out_dir results/figures || \
+		$(PY) scripts/visualize_identity_benchmark.py --results_dir results --out_dir report/graphs || \
 		echo "[viz][note] matplotlib missing or plotting failed; skipping" ; \
 	else \
 		echo "[viz][note] results/summary_by_id_threshold.json not found; run the benchmark first" ; \

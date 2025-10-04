@@ -97,15 +97,31 @@ def filter_or_expand_ec(df: pd.DataFrame, allow_multi_ec: bool) -> pd.DataFrame:
     df = df.assign(ec=df["ec"].str.split(";")).explode("ec")
     df["ec"] = df["ec"].str.strip()
     df = df[df["ec"] != ""]
+    # Drop duplicated accession/EC pairs that can appear when the source data
+    # repeats rows. This keeps the downstream grouping deterministic.
+    df = df.drop_duplicates(subset=["accession", "ec"], keep="first")
     return df[cols]
 
 
-def group_by_ec(df: pd.DataFrame) -> Dict[str, List[str]]:
+def group_by_ec(
+    df: pd.DataFrame,
+) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
+    """Return both EC→accessions and accession→EC lists."""
+
     grp: Dict[str, List[str]] = {}
+    df = df.assign(accession=df["accession"].astype(str), ec=df["ec"].astype(str))
     for ec, sub in df.groupby("ec"):
-        accs = sub["accession"].astype(str).tolist()
+        # Deduplicate within each EC to avoid double counting when allow_multi_ec
+        # expands rows.
+        accs = sorted(set(sub["accession"].tolist()))
         grp[ec] = accs
-    return grp
+
+    accession_to_ecs: Dict[str, List[str]] = {}
+    for acc, sub in df.groupby("accession"):
+        ecs = sorted(set(sub["ec"].tolist()))
+        accession_to_ecs[acc] = ecs
+
+    return grp, accession_to_ecs
 
 
 def split_classes(classes: List[str], seed: int) -> Tuple[List[str], List[str], List[str]]:
@@ -202,21 +218,78 @@ def main() -> None:
                 return g.sample(n=n, random_state=cfg.seed)
             df = df.groupby("ec", group_keys=False).apply(_take_n)
 
-    by_ec = group_by_ec(df)
+    by_ec, accession_to_ecs = group_by_ec(df)
     base_classes = [ec for ec, accs in by_ec.items() if len(accs) >= cfg.min_per_class]
     holdout_classes = [ec for ec, accs in by_ec.items() if len(accs) < cfg.min_per_class]
 
-    tr_c, va_c, te_c = split_classes(base_classes, cfg.seed)
+    # Build connected components of EC classes that share accessions so that each
+    # accession (and all of its EC labels) can be assigned to a single split.
+    component_id_by_ec: Dict[str, int] = {}
+    components: List[List[str]] = []
+    visited_ec: set[str] = set()
 
-    def classes_to_items(eclist: List[str]) -> List[dict]:
-        return [dict(ec=ec, accessions=by_ec[ec]) for ec in sorted(eclist)]
+    for ec in by_ec:
+        if ec in visited_ec:
+            continue
+        stack = [ec]
+        members: List[str] = []
+        while stack:
+            cur = stack.pop()
+            if cur in visited_ec:
+                continue
+            visited_ec.add(cur)
+            members.append(cur)
+            for acc in by_ec[cur]:
+                for neigh in accession_to_ecs.get(acc, []):
+                    if neigh not in visited_ec:
+                        stack.append(neigh)
+        cid = len(components)
+        components.append(members)
+        for member in members:
+            component_id_by_ec[member] = cid
 
-    # meta-test includes the test split from base classes + ALL holdout classes
-    test_all = te_c + holdout_classes
+    base_component_ids = sorted({component_id_by_ec[ec] for ec in base_classes})
+    tr_components, va_components, te_components = split_classes(base_component_ids, cfg.seed)
 
-    write_jsonl(cfg.splits_dir / "train.jsonl", classes_to_items(tr_c))
-    write_jsonl(cfg.splits_dir / "val.jsonl", classes_to_items(va_c))
-    write_jsonl(cfg.splits_dir / "test.jsonl", classes_to_items(test_all))
+    component_to_split: Dict[int, str] = {}
+    for cid in tr_components:
+        component_to_split[cid] = "train"
+    for cid in va_components:
+        component_to_split[cid] = "val"
+    for cid in te_components:
+        component_to_split[cid] = "test"
+    for cid in range(len(components)):
+        component_to_split.setdefault(cid, "test")
+
+    ec_split: Dict[str, str] = {
+        ec: component_to_split[component_id_by_ec[ec]] for ec in by_ec
+    }
+
+    accession_split: Dict[str, str] = {}
+    for acc, ecs in accession_to_ecs.items():
+        if not ecs:
+            continue
+        first_ec = ecs[0]
+        cid = component_id_by_ec[first_ec]
+        accession_split[acc] = component_to_split[cid]
+
+    def classes_to_items(split_name: str) -> List[dict]:
+        items: List[dict] = []
+        for ec in sorted(ec for ec, sp in ec_split.items() if sp == split_name):
+            accs = [
+                acc for acc in by_ec[ec] if accession_split.get(acc) == split_name
+            ]
+            if accs:
+                items.append(dict(ec=ec, accessions=accs))
+        return items
+
+    tr_c = [ec for ec in base_classes if ec_split[ec] == "train"]
+    va_c = [ec for ec in base_classes if ec_split[ec] == "val"]
+    te_c = [ec for ec in base_classes if ec_split[ec] == "test"]
+
+    write_jsonl(cfg.splits_dir / "train.jsonl", classes_to_items("train"))
+    write_jsonl(cfg.splits_dir / "val.jsonl", classes_to_items("val"))
+    write_jsonl(cfg.splits_dir / "test.jsonl", classes_to_items("test"))
 
     print(
         f"[prepare_split] classes: base={len(base_classes)} (train={len(tr_c)}, val={len(va_c)}, test={len(te_c)}), "

@@ -340,7 +340,8 @@ class EpisodeSampler:
             self.rng.shuffle(cids)
             need = K + Q
             if len(cids) < need:
-                raise ClusterShortageError(ec, len(cids), need)
+                self._record_cluster_shortage(ec, len(cids), need)
+                return self._sample_with_replacement_plain(pool_idx, K, Q)
             support_cids = cids[:K]
             query_cids = cids[K : K + Q]
             support_idx = [self.rng.choice(clusters[cid]) for cid in support_cids]
@@ -477,13 +478,21 @@ class EpisodeSampler:
                 self._log_fallback(ec, count, need)
                 self.fallback_per_ec[ec] += 1
             else:
-                s_idx, q_idx = self._sample_standard(ec, pool_idx, K, Q)
-                if self.disjoint_support_query:
-                    overlap = set(s_idx).intersection(q_idx)
-                    if overlap:
-                        raise AssertionError(
-                            f"support/query overlap without fallback for EC {ec}: {overlap}"
-                        )
+                try:
+                    s_idx, q_idx = self._sample_standard(ec, pool_idx, K, Q)
+                except ClusterShortageError as err:
+                    if not self.allow_fallback:
+                        raise
+                    s_idx, q_idx = self._sample_with_replacement(ec, pool_idx, K, Q)
+                    self._log_fallback(ec, err.have, err.need)
+                    self.fallback_per_ec[ec] += 1
+                else:
+                    if self.disjoint_support_query:
+                        overlap = set(s_idx).intersection(q_idx)
+                        if overlap:
+                            raise AssertionError(
+                                f"support/query overlap without fallback for EC {ec}: {overlap}"
+                            )
             combined = s_idx + q_idx
             if use_fallback:
                 counts = Counter(combined)
@@ -533,13 +542,15 @@ class EpisodeSampler:
         if K <= 0 or Q <= 0:
             raise ValueError("K and Q must be positive integers")
         need = K + Q
-        allow_underfilled = self.allow_fallback
+        # Allow selecting underfilled tail classes during eval as well
+        # (see: Handle tail classes during evaluation #22)
+        allow_underfilled = self.allow_fallback or self._eval_tail_fallback
         attempts = 0
         shortage_attempts: DefaultDict[str, int] = defaultdict(int)
 
         while attempts < self._max_cluster_resample_attempts:
             attempts += 1
-            classes = self._pick_classes(M, need, allow_underfilled)
+            classes = self._pick_classes(M, need, K, allow_underfilled)
             try:
                 return self._build_episode(classes, K, Q, need, allow_underfilled)
             except ClusterShortageError as err:

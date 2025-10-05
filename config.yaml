@@ -65,7 +65,7 @@ tau_multi: 0.40               # base sigmoid threshold for multi-label emission
 sampler:
   identity_disjoint: true
   with_replacement_fallback: true          # train only, for classes with count < K+Q
-  fallback_scope: train_only
+  fallback_scope: all
   rare_class_boost: inverse_log_freq       # sample tail ECs more often
 
 eval:

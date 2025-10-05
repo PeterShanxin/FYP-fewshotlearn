@@ -275,6 +275,77 @@ def _choose_split_with_coverage(
     return None
 
 
+def _ensure_splits(
+    cfg: dict,
+    *,
+    prepare_if_missing: bool,
+    config_path: Path,
+) -> Path:
+    """Ensure base train/val/test JSONL splits exist, preparing them if requested."""
+
+    paths = cfg.get("paths", {}) or {}
+    splits_dir = Path(paths.get("splits_dir", "data/splits"))
+    required = [splits_dir / name for name in ("train.jsonl", "val.jsonl", "test.jsonl")]
+
+    if all(p.exists() for p in required):
+        return splits_dir
+
+    if not prepare_if_missing:
+        missing = ", ".join(p.name for p in required if not p.exists()) or "train.jsonl"
+        raise FileNotFoundError(
+            f"Missing split files ({missing}) under {splits_dir}. "
+            "Run python src/prepare_split.py -c CONFIG to generate them."
+        )
+
+    print(f"[auto_tune_tau] Preparing base splits → {splits_dir}")
+    cmd = ["python", "src/prepare_split.py", "-c", str(config_path)]
+    subprocess.run(cmd, check=True)
+
+    if not all(p.exists() for p in required):
+        raise FileNotFoundError(
+            f"Split preparation completed but required files still missing under {splits_dir}."
+        )
+
+    return splits_dir
+
+
+def _ensure_clusters(
+    cfg: dict,
+    *,
+    prepare_if_missing: bool,
+    config_path: Path,
+) -> Optional[Path]:
+    """Ensure identity cluster TSV exists for episodic sampling constraints."""
+
+    paths = cfg.get("paths", {}) or {}
+    clusters = paths.get("clusters_tsv")
+    if not clusters:
+        return None
+    clusters_path = Path(clusters)
+    if clusters_path.exists():
+        return clusters_path
+
+    if not prepare_if_missing:
+        raise FileNotFoundError(
+            f"clusters_tsv not found: {clusters_path}. "
+            "Run python scripts/cluster_sequences.py -c CONFIG to generate it."
+        )
+
+    # Ensure splits exist before clustering (cluster pipeline depends on them)
+    _ensure_splits(cfg, prepare_if_missing=True, config_path=config_path)
+
+    print(f"[auto_tune_tau] Building identity clusters → {clusters_path}")
+    cmd = ["python", "scripts/cluster_sequences.py", "-c", str(config_path)]
+    subprocess.run(cmd, check=True)
+
+    if not clusters_path.exists():
+        raise FileNotFoundError(
+            f"Cluster generation completed but {clusters_path} is still missing."
+        )
+
+    return clusters_path
+
+
 def _ensure_prototypes(
     cfg: dict,
     desired_out: Path,
@@ -293,10 +364,33 @@ def _ensure_prototypes(
     # Attempt to build from train split and checkpoint
     paths = cfg.get("paths", {}) or {}
     embeddings_path = Path(paths["embeddings"]) if "embeddings" in paths else None
-    splits_dir = Path(paths["splits_dir"]) if "splits_dir" in paths else None
     outputs_dir = Path(paths.get("outputs", "results"))
     ckpt_path = outputs_dir / "checkpoints" / "protonet.pt"
-    train_split = (Path(splits_dir) / "train.jsonl") if splits_dir else None
+
+    splits_dir: Optional[Path] = None
+    try:
+        splits_dir = _ensure_splits(
+            cfg,
+            prepare_if_missing=bool(train_if_missing),
+            config_path=config_path if config_path is not None else Path("config.yaml"),
+        )
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"Unable to locate base splits required for training/prototype building: {exc}"
+        ) from exc
+
+    try:
+        _ensure_clusters(
+            cfg,
+            prepare_if_missing=bool(train_if_missing),
+            config_path=config_path if config_path is not None else Path("config.yaml"),
+        )
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"Unable to locate identity clusters required for training: {exc}"
+        ) from exc
+
+    train_split = splits_dir / "train.jsonl" if splits_dir is not None else None
 
     if not (embeddings_path and train_split):
         raise FileNotFoundError(

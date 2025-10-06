@@ -222,7 +222,7 @@ Your mileage varies with data volume and CPU/GPU.
 ---
 
 ## Core Features
-- Identity‑aware episodes: enabled by default with `identity_disjoint: true`. Generate the clustering map via `scripts/cluster_sequences.py` using MMseqs2 when available (Python fallback for small tests). Defaults: `cluster_identity: 0.5`, `cluster_coverage: 0.5`.
+- Identity‑aware episodes: enabled by default with `identity_disjoint: true`. Generate the clustering map via `scripts/cluster_sequences.py`; MMseqs2 must be available on PATH (the script exits otherwise). Defaults: `cluster_identity: 0.5`, `cluster_coverage: 0.5`.
 - Multi‑EC support: enabled via `allow_multi_ec: true` (split expansion) and `multi_label: true` (BCE over episode classes). Episodic accuracy counts a prediction as correct if top‑1 is among true labels.
 - EC hierarchy: enabled via `hierarchy_levels` (1–3) and `hierarchy_weight` to add auxiliary losses at coarser EC levels using prototype grouping per episode.
 
@@ -231,7 +231,7 @@ On module-managed clusters, load MMseqs2 before running the pipeline:
 ```bash
 module load MMseqs2
 ```
-If MMseqs2 is not available on PATH, the scripts fall back to a slow Python implementation suitable only for small smoke tests.
+If MMseqs2 is not available on PATH, the clustering steps now exit with an error; install it locally or load the module before running the pipeline.
 
 You can also declare modules in your config to have `run_all.sh` load them automatically:
 ```yaml

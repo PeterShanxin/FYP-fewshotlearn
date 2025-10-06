@@ -4,8 +4,7 @@
 Enhancements:
 - Build clusters as connected components of the ≥T% identity graph to ensure
   no cross-fold identity leakage at the threshold (when tools available).
-- Fast path uses MMseqs2 pairwise search with coverage filter; fallback
-  to a Python O(N^2) approximate identity for small smoke tests.
+- Uses MMseqs2 pairwise search with coverage filter (module must be available on PATH).
 - Persist artifacts per threshold under results/split-XX/ (clusters, folds, config) and
   split JSONLs under results/split-XX/fold-YY/{train,val,test}.jsonl.
 """
@@ -134,7 +133,7 @@ def mmseqs_pairwise_edges(
     return sorted(edges)
 
 
-# CD-HIT support removed for simplicity; MMseqs2 or Python fallback only.
+# CD-HIT support removed for simplicity; MMseqs2 is the required backend.
 
 
 def mmseqs_cluster_components(
@@ -212,26 +211,6 @@ def mmseqs_cluster_components(
 
     return [sorted(list(members)) for rep, members in sorted(clusters.items(), key=lambda kv: kv[0])]
 
-
-# CD-HIT support removed for simplicity; MMseqs2 or Python fallback only.
-
-def python_pairwise_edges(pairs: List[Tuple[str, str]], min_ratio: float) -> List[Tuple[str, str]]:
-    """Very slow O(N^2) approximate edge builder using difflib ratio.
-
-    Returns undirected edges (a,b) with a < b when ratio ≥ min_ratio.
-    """
-    import difflib
-    edges: List[Tuple[str, str]] = []
-    N = len(pairs)
-    for i in range(N):
-        ai, si = pairs[i]
-        for j in range(i + 1, N):
-            aj, sj = pairs[j]
-            r = difflib.SequenceMatcher(a=si, b=sj).ratio()
-            if r >= min_ratio:
-                lo, hi = (ai, aj) if ai < aj else (aj, ai)
-                edges.append((lo, hi))
-    return edges
 
 def connected_components(nodes: Iterable[str], edges: List[Tuple[str, str]]) -> List[List[str]]:
     parent: Dict[str, str] = {}
@@ -406,54 +385,51 @@ def main() -> None:
     for cut in cuts:
         pct = int(round(cut * 100))
         print(f"[id-split] cutoff={pct}% | building identity graph → components…")
-        # Compute components (fast path: MMseqs2; fallback: Python)
+        # Compute components with MMseqs2; pipeline requires module availability.
         work = Path(f"data/identity/_work_id{pct}")
         work.mkdir(parents=True, exist_ok=True)
         fasta = work / "all.fasta"
         write_fasta(pairs, fasta)
-        mmseqs_ok = shutil.which("mmseqs") is not None and identity_definition in ("tool_default",)
+        if shutil.which("mmseqs") is None:
+            raise SystemExit(
+                "[id-split][error] MMseqs2 not found on PATH. Load the MMseqs2 module before running this step."
+            )
+
         comps: List[List[str]]
-        if mmseqs_ok:
-            cov = float(cfg.get('cluster_coverage', 0.5))
-            # Optional override via config: mmseqs_threads
-            cfg_thr = cfg.get("mmseqs_threads")
-            try:
-                cfg_thr_i = int(cfg_thr) if cfg_thr is not None else None
-            except Exception:
-                cfg_thr_i = None
-            thr_used = detect_allocated_cpus(cfg_thr_i)
-            backend = backend_pref if backend_pref in {"linclust", "cluster", "easy_search", "edges", "edge"} else "easy_search"
-            if backend in {"linclust", "cluster"}:
-                mmseqs_mode = "linclust" if backend == "linclust" else "cluster"
-                print(
-                    f"[id-split][mmseqs] {mmseqs_mode} min_id={cut} cov>={cov} threads={thr_used} "
-                    f"(quiet; logs under {work/'logs'})"
-                )
-                comps = mmseqs_cluster_components(
-                    fasta,
-                    work,
-                    min_id=cut,
-                    min_cov=cov,
-                    threads=thr_used,
-                    mode=mmseqs_mode,
-                )
-                clustering_method = f"mmseqs_{mmseqs_mode}"
-                identity_def_used = "tool_default"
-            else:
-                print(
-                    f"[id-split][mmseqs] easy-search min_id={cut} cov>={cov} threads={thr_used} "
-                    f"(quiet; logs at {work/'logs/mmseqs_easy_search.log'})"
-                )
-                edges = mmseqs_pairwise_edges(fasta, work, min_id=cut, min_cov=cov, threads=thr_used)
-                comps = connected_components(nodes, edges)
-                clustering_method = "mmseqs_easy_search"
-                identity_def_used = "tool_default"
+        cov = float(cfg.get('cluster_coverage', 0.5))
+        # Optional override via config: mmseqs_threads
+        cfg_thr = cfg.get("mmseqs_threads")
+        try:
+            cfg_thr_i = int(cfg_thr) if cfg_thr is not None else None
+        except Exception:
+            cfg_thr_i = None
+        thr_used = detect_allocated_cpus(cfg_thr_i)
+        backend = backend_pref if backend_pref in {"linclust", "cluster", "easy_search", "edges", "edge"} else "easy_search"
+        if backend in {"linclust", "cluster"}:
+            mmseqs_mode = "linclust" if backend == "linclust" else "cluster"
+            print(
+                f"[id-split][mmseqs] {mmseqs_mode} min_id={cut} cov>={cov} threads={thr_used} "
+                f"(quiet; logs under {work/'logs'})"
+            )
+            comps = mmseqs_cluster_components(
+                fasta,
+                work,
+                min_id=cut,
+                min_cov=cov,
+                threads=thr_used,
+                mode=mmseqs_mode,
+            )
+            clustering_method = f"mmseqs_{mmseqs_mode}"
+            identity_def_used = "tool_default"
         else:
-            print("[id-split][warn] MMseqs2 not found; using Python approximate pairwise identity (slow, approximate)")
-            edges = python_pairwise_edges(pairs, min_ratio=cut)
+            print(
+                f"[id-split][mmseqs] easy-search min_id={cut} cov>={cov} threads={thr_used} "
+                f"(quiet; logs at {work/'logs/mmseqs_easy_search.log'})"
+            )
+            edges = mmseqs_pairwise_edges(fasta, work, min_id=cut, min_cov=cov, threads=thr_used)
             comps = connected_components(nodes, edges)
-            clustering_method = "python_difflib_ratio"
-            identity_def_used = "global_pairwise"
+            clustering_method = "mmseqs_easy_search"
+            identity_def_used = "tool_default"
         print(f"[id-split] components built: {len(comps)} clusters at {pct}%")
         clu2acc: Dict[str, List[str]] = {}
         for comp in comps:

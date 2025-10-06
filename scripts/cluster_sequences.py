@@ -2,8 +2,8 @@
 """Cluster sequences at a fixed identity threshold (default: 50%).
 
 Pipeline step to generate an accession->cluster_id TSV for identity-aware
-episode sampling. Uses MMseqs2 when available; falls back to a slow
-approximate Python clustering if MMseqs2 is not available.
+episode sampling. Requires MMseqs2 to be available on PATH; the script exits
+with an error if the binary cannot be located.
 
 Outputs to paths.clusters_tsv from the config.
 """
@@ -108,36 +108,6 @@ def cluster_with_mmseqs(fasta: Path, workdir: Path, min_id: float, min_cov: floa
     return mapping
 
 
-# CD-HIT support removed for simplicity; MMseqs2 or Python fallback only.
-
-
-def sim_ratio(a: str, b: str) -> float:
-    # Fallback approximate similarity (SequenceMatcher-based)
-    import difflib
-    return difflib.SequenceMatcher(a=a, b=b).ratio()
-
-
-def cluster_greedy(pairs: List[Tuple[str, str]], min_ratio: float) -> Dict[str, str]:
-    # Very slow O(N^2) fallback; warn on large N
-    N = len(pairs)
-    if N > 5000:
-        print(f"[cluster][warn] {N} sequences; Python fallback clustering may be very slow."
-              " Install MMseqs2 for speed.")
-    mapping: Dict[str, str] = {}
-    for i, (acc_i, seq_i) in enumerate(pairs):
-        if acc_i in mapping:
-            continue
-        # new cluster representative = acc_i
-        mapping[acc_i] = acc_i
-        for j in range(i + 1, N):
-            acc_j, seq_j = pairs[j]
-            if acc_j in mapping:
-                continue
-            if sim_ratio(seq_i, seq_j) >= min_ratio:
-                mapping[acc_j] = acc_i
-    return mapping
-
-
 def write_clusters_tsv(mapping: Dict[str, str], out_tsv: Path) -> None:
     out_tsv.parent.mkdir(parents=True, exist_ok=True)
     with open(out_tsv, "w", encoding="utf-8") as f:
@@ -170,13 +140,20 @@ def main() -> None:
     fasta = workdir / "split_sequences.fasta"
     write_fasta(pairs, fasta)
 
-    mapping: Dict[str, str] = {}
-    if shutil.which("mmseqs") is not None:
-        print(f"[cluster] Using MMseqs2 at min_id={min_id}, min_cov={min_cov} (quiet; logs under {workdir/'logs'})")
-        mapping = cluster_with_mmseqs(fasta, workdir, min_id=min_id, min_cov=min_cov)
-    else:
-        print("[cluster] MMseqs2 not found; falling back to slow Python clustering (approximate)")
-        mapping = cluster_greedy(pairs, min_ratio=min_id)
+    if shutil.which("mmseqs") is None:
+        raise SystemExit(
+            "[cluster][error] MMseqs2 not found on PATH. Load the MMseqs2 module before running this step."
+        )
+
+    print(
+        f"[cluster] Using MMseqs2 at min_id={min_id}, min_cov={min_cov} (quiet; logs under {workdir/'logs'})"
+    )
+    mapping: Dict[str, str] = cluster_with_mmseqs(
+        fasta,
+        workdir,
+        min_id=min_id,
+        min_cov=min_cov,
+    )
 
     if not mapping:
         raise SystemExit("[cluster] Clustering produced no mapping; aborting.")

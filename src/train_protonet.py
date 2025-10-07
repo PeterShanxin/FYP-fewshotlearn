@@ -99,6 +99,11 @@ def episodic_accuracy(
             excluded=coverage["excluded"],
         )
     )
+    # If no class can satisfy even support-only under the current constraints,
+    # return 0.0 instead of crashing the run during smoke/edge cases.
+    if (coverage["eligible_full"] + coverage["eligible_support_only"]) <= 0:
+        print("[val][coverage] No eligible classes for validation under current (K,Q) and disjoint settings; returning 0.0.")
+        return 0.0
     if coverage["eligible_full"] < M:
         print(
             "[val][coverage] WARNING: only {full} classes can fill support+query without fallback; requesting M={M}".format(
@@ -116,7 +121,13 @@ def episodic_accuracy(
                 disable=not show_progress,
                 position=1,
             ):
-                sx, sy, qx, qy, _classes = val_sampler.sample_episode(M, K, Q)
+                try:
+                    sx, sy, qx, qy, _classes = val_sampler.sample_episode(M, K, Q)
+                except RuntimeError as exc:
+                    # Gracefully skip pathological validation episodes in tiny splits
+                    # (e.g., identity-disjoint with too few clusters). Count as 0.
+                    print(f"[val][warn] skipping episode due to sampling error: {exc}")
+                    continue
                 pred = model.predict(sx, sy, qx)
                 if multi_label and qy.dim() == 2:
                     take = torch.gather(qy, 1, pred.view(-1, 1)).squeeze(1)
@@ -216,6 +227,8 @@ def main() -> None:
     with_replacement_fallback = bool(sampler_cfg.get("with_replacement_fallback", False))
     fallback_scope = sampler_cfg.get("fallback_scope", "train_only")
     rare_class_boost = sampler_cfg.get("rare_class_boost", "none")
+    view_dropout = float(sampler_cfg.get("view_dropout", 0.08))
+    view_noise_sigma = float(sampler_cfg.get("view_noise_sigma", 0.01))
 
     seq_lookup: Optional[Dict[str, str]] = None
     if with_replacement_fallback:
@@ -240,6 +253,8 @@ def main() -> None:
         rare_class_boost=rare_class_boost,
         sequence_lookup=seq_lookup,
         usage_log_dir=usage_dir,
+        view_dropout=view_dropout,
+        view_noise_sigma=view_noise_sigma,
     )
     val_sampler = EpisodeSampler(
         Path(paths["embeddings"]),
@@ -254,6 +269,8 @@ def main() -> None:
         fallback_scope=fallback_scope,
         rare_class_boost="none",
         sequence_lookup=seq_lookup if fallback_scope == "all" else None,
+        view_dropout=view_dropout,
+        view_noise_sigma=view_noise_sigma,
     )
     episode_cfg = cfg.get("episode", {}) or {}
 

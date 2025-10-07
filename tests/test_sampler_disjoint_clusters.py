@@ -77,8 +77,8 @@ def test_disjoint_sampling_resamples_on_cluster_shortage(tmp_path: Path) -> None
     sx, sy, qx, qy, classes = sampler.sample_episode(M=1, K=1, Q=1)
 
     assert classes == ["A"]
-    assert sampler.cluster_shortage_counts["B"] >= 1
-    assert sampler.cluster_shortage_dropped_episodes == 0
+    assert "B" in sampler._skipped_single_cluster
+    assert sampler.cluster_shortage_counts.get("B", 0) == 0
 
     support_vec = sx.numpy()[0]
     query_vec = qx.numpy()[0]
@@ -110,7 +110,7 @@ def test_disjoint_sampling_raises_after_repeated_cluster_shortage(tmp_path: Path
     with pytest.raises(RuntimeError) as excinfo:
         sampler.sample_episode(M=1, K=1, Q=1)
 
-    assert "Unable to sample episode" in str(excinfo.value)
-    assert sampler.cluster_shortage_dropped_episodes == 1
-    assert sampler.cluster_shortage_counts["C"] >= sampler._max_cluster_resample_attempts
-    assert sampler.cluster_shortage_last_drop == {"C": sampler._max_cluster_resample_attempts}
+    assert "Not enough classes with embeddings" in str(excinfo.value)
+    assert sampler.cluster_shortage_dropped_episodes == 0
+    assert sampler.cluster_shortage_counts.get("C", 0) == 0
+    assert sampler._skipped_single_cluster == {"C"}

@@ -1,0 +1,89 @@
+#!/bin/bash
+#
+# PBS batch script to run the end-to-end identity benchmark via scripts/run_all.sh
+# Submit with:  qsub scripts/run_as_batch.pbs
+#
+# Notes for Vanda HPC users:
+# - This runs in the background on a compute node. You may disconnect safely.
+# - Edit resource lines below to match your needs (GPUs, CPUs, memory, walltime).
+# - Use environment variables to override config or flags without editing the file:
+#     qsub -v CFG=config.smoke.yaml scripts/run_as_batch.pbs
+#     qsub -v EXTRA_FLAGS="--calibrate-only" scripts/run_as_batch.pbs
+# - The pipeline writes detailed status to results/logs/run_all_status.log
+#   and creates outputs under results/.
+
+# -------- Job metadata & resources --------
+#PBS -N fyp_runall
+# Job name (shows up in qstat)
+#PBS -q auto
+# Route queue; scheduler sends job to GPU partition
+#PBS -l select=1:ncpus=8:ngpus=1:mem=64GB
+# 1 node, 1 GPU, 8 CPUs, 64GB RAM
+#PBS -l walltime=24:00:00
+# Max runtime (HH:MM:SS)
+#PBS -j oe
+# Join stdout/stderr into one stream
+#PBS -V
+# Export current environment to the job
+#PBS -P personal-e0969321
+# Charge usage to your personal allocation
+
+set -euo pipefail
+
+# Always start in the directory where qsub was executed
+cd "$PBS_O_WORKDIR"
+
+echo "[batch] Job $PBS_JOBID started on $(hostname) at $(date)"
+echo "[batch] Working directory: $PWD"
+
+# -------- Environment setup --------
+# If your cluster uses Environment Modules, load what you need here.
+# Adjust versions to your site (or comment if not applicable).
+if type module >/dev/null 2>&1; then
+  module purge || true
+  # Python for running the pipeline and its .venv/conda envs
+  module load python/3.10 || true
+  # CUDA for PyTorch GPU acceleration (match your Torch build if needed)
+  module load cuda/12.1   || true
+  # MMseqs2 is required for identity clustering and validation checks
+  module load MMseqs2     || true
+fi
+
+# Option A (recommended): use the repo's local virtualenv if present.
+# Note: scripts/run_all.sh will auto-activate .venv if not already active.
+# Uncomment to activate explicitly:
+# if [ -d ".venv" ]; then source .venv/bin/activate; fi
+
+# Option B: conda/mamba environment (uncomment and adjust to your env name)
+# source "$HOME/mambaforge/etc/profile.d/conda.sh"
+# conda activate fsl-env
+
+# Limit thread oversubscription for BLAS/NumPy
+export OMP_NUM_THREADS="${PBS_NCPUS:-8}"
+export MKL_NUM_THREADS="$OMP_NUM_THREADS"
+
+# Propagate a scope tag so run_all status lines are annotated with the PBS JobID
+export RUNALL_SCOPE_TAG="pbs_job=${PBS_JOBID}"
+
+# -------- Config & flags --------
+# You can override these at submission time via: qsub -v CFG=config.smoke.yaml,EXTRA_FLAGS="--calibrate-only"
+CFG="${CFG:-config.yaml}"
+EXTRA_FLAGS="${EXTRA_FLAGS:-}"
+
+# IMPORTANT: We request 1 GPU by default. To avoid mismatches if your
+# config.yaml has gpus: >1, we pin visibility to a single device unless
+# already set by the scheduler/site.
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+
+# -------- Run the pipeline --------
+# This wrapper orchestrates: fetch → optional top-up → prepare_splits → benchmark → visualize
+# Detailed progress is appended to results/logs/run_all_status.log
+
+echo "[batch] Using CFG=$CFG"
+echo "[batch] EXTRA_FLAGS=$EXTRA_FLAGS"
+
+bash scripts/run_all.sh "$CFG" $EXTRA_FLAGS
+
+status=$?
+echo "[batch] Job $PBS_JOBID finished at $(date) with exit code $status"
+exit "$status"

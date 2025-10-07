@@ -62,6 +62,19 @@ def eval_for_K(
             excluded=coverage["excluded"],
         )
     )
+    # If nothing can be sampled under current constraints (e.g., identity-disjoint
+    # with single-cluster classes in tiny smoke runs), return zeros instead of failing.
+    if (coverage["eligible_full"] + coverage["eligible_support_only"]) <= 0:
+        print("[eval][coverage] No eligible classes; returning zeros.")
+        return {
+            "acc_top1_hit": 0.0,
+            "micro_precision": 0.0,
+            "micro_recall": 0.0,
+            "micro_f1": 0.0,
+            "macro_precision": 0.0,
+            "macro_recall": 0.0,
+            "macro_f1": 0.0,
+        }
     if coverage["eligible_full"] < M:
         print(
             "[eval][coverage] WARNING: only {full} classes can fill support+query without fallback; requesting M={M}".format(
@@ -76,7 +89,11 @@ def eval_for_K(
             dynamic_ncols=True,
             disable=not show_progress,
         ):
-            sx, sy, qx, qy, classes = sampler.sample_episode(M, K, Q)
+            try:
+                sx, sy, qx, qy, classes = sampler.sample_episode(M, K, Q)
+            except RuntimeError as exc:
+                print(f"[eval][warn] skipping episode due to sampling error: {exc}")
+                continue
             logits, _ = model(sx, sy, qx, None)
             sm = torch.softmax(logits, dim=-1)
             pred = sm.argmax(dim=-1)
@@ -249,14 +266,12 @@ def main() -> None:
         fallback_scope=fallback_scope,
         rare_class_boost="none",
     )
-    tau_eval_cfg = eval_cfg.get("tau_multi")
-    tau_root_cfg = cfg.get("tau_multi")
-    if tau_eval_cfg is not None:
-        tau_multi = float(tau_eval_cfg)
-    elif tau_root_cfg is not None:
-        tau_multi = float(tau_root_cfg)
-    else:
-        tau_multi = 0.6
+    tau_cfg = eval_cfg.get("tau_multi")
+    if tau_cfg is None:
+        raise ValueError(
+            "Missing 'eval.tau_multi' in configuration. Set a base sigmoid threshold or enable calibration."
+        )
+    tau_multi = float(tau_cfg)
 
     # Honor toggles for tuned parameters
     use_calibration = bool(eval_cfg.get("use_calibration", True))

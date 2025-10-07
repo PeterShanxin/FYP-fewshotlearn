@@ -92,6 +92,8 @@ class EpisodeSampler:
         rare_class_boost: str = "none",
         sequence_lookup: Optional[Dict[str, str]] = None,
         usage_log_dir: Optional[Path] = None,
+        view_dropout: float = 0.08,
+        view_noise_sigma: float = 0.01,
     ) -> None:
         self.device = device
         self.phase = phase.lower()
@@ -168,6 +170,12 @@ class EpisodeSampler:
                     a, cid = parts[0], parts[1]
                     self.acc2cluster[a] = cid
 
+        self.class_cluster_counts: Dict[str, int] = {}
+        if self.disjoint_support_query and self.acc2cluster:
+            for ec, rows in self.class2idx.items():
+                clusters = {self.acc2cluster.get(self._idx2acc(idx), f"_na_{idx}") for idx in rows}
+                self.class_cluster_counts[ec] = len(clusters)
+
         # Sequence lookup (needed for augmentation in fallback mode)
         self.seq_lookup: Dict[str, str] = dict(sequence_lookup or {})
         if self.allow_fallback and not self.seq_lookup:
@@ -188,6 +196,7 @@ class EpisodeSampler:
         self.usage_log_path = (usage_log_dir / "sampler_stats.csv") if usage_log_dir else None
         self._current_underfilled: Set[str] = set()
         self._last_pick_stats: Dict[str, int] = {}
+        self._skipped_single_cluster: Set[str] = set()
 
         # Cluster shortage diagnostics (for disjoint support/query sampling)
         self.cluster_shortage_counts: DefaultDict[str, int] = defaultdict(int)
@@ -197,8 +206,8 @@ class EpisodeSampler:
         self._max_cluster_resample_attempts = 10
 
         # View augmentation hyper-parameters
-        self._view_dropout = 0.08
-        self._view_noise_sigma = 0.01
+        self._view_dropout = float(view_dropout)
+        self._view_noise_sigma = float(view_noise_sigma)
 
     # ---------------------------------------------------------------------
     # Helpers
@@ -255,11 +264,17 @@ class EpisodeSampler:
         eligible_full: List[str] = []
         eligible_support_only: List[str] = []
         total_classes = 0
+        require_clusters = self.disjoint_support_query and bool(self.acc2cluster)
         for ec in self.split.classes:
             count = self.class_counts.get(ec, 0)
             if count == 0:
                 continue
             total_classes += 1
+            if require_clusters:
+                cluster_count = self.class_cluster_counts.get(ec, 0)
+                if cluster_count < 2:
+                    self._note_single_cluster_skip(ec, cluster_count)
+                    continue
             if count >= need:
                 eligible_full.append(ec)
             elif allow_underfilled and count >= support:
@@ -340,8 +355,22 @@ class EpisodeSampler:
             self.rng.shuffle(cids)
             need = K + Q
             if len(cids) < need:
+                # Maintain support/query cluster disjointness even under shortage
+                # by partitioning available clusters between sides and sampling
+                # with replacement within each side's cluster set. If fewer than
+                # 2 clusters exist, escalate to caller to resample classes.
+                if len(cids) < 2:
+                    raise ClusterShortageError(ec, len(cids), need)
                 self._record_cluster_shortage(ec, len(cids), need)
-                return self._sample_with_replacement_plain(pool_idx, K, Q)
+                # Proportional split of clusters into support/query bins
+                s_clusters = max(1, min(len(cids) - 1, int(round(len(cids) * (K / float(max(K + Q, 1)))))))
+                q_clusters = max(1, len(cids) - s_clusters)
+                s_cids = cids[:s_clusters]
+                q_cids = cids[s_clusters:]
+                # Round-robin draw within each bin with replacement
+                support_idx = [self.rng.choice(clusters[s_cids[i % len(s_cids)]]) for i in range(K)]
+                query_idx = [self.rng.choice(clusters[q_cids[i % len(q_cids)]]) for i in range(Q)]
+                return support_idx, query_idx
             support_cids = cids[:K]
             query_cids = cids[K : K + Q]
             support_idx = [self.rng.choice(clusters[cid]) for cid in support_cids]
@@ -442,6 +471,14 @@ class EpisodeSampler:
                 f"[sampler][{self.phase}] cluster shortage for EC {ec}: "
                 f"clusters={have}, need={need}"
             )
+
+    def _note_single_cluster_skip(self, ec: str, clusters: int) -> None:
+        if ec in self._skipped_single_cluster:
+            return
+        self._skipped_single_cluster.add(ec)
+        _progress_write(
+            f"[sampler][{self.phase}] skipping EC {ec}: clusters={clusters}, need≥2 for disjoint support/query"
+        )
 
     def _log_fallback(self, ec: str, have: int, need: int) -> None:
         self.fallback_events += 1
@@ -606,11 +643,16 @@ class EpisodeSampler:
         total = 0
         eligible_full = 0
         eligible_support_only = 0
+        require_clusters = self.disjoint_support_query and bool(self.acc2cluster)
         for ec in self.split.classes:
             count = self.class_counts.get(ec, 0)
             if count <= 0:
                 continue
             total += 1
+            if require_clusters:
+                cluster_count = self.class_cluster_counts.get(ec, 0)
+                if cluster_count < 2:
+                    continue
             if count >= need:
                 eligible_full += 1
             elif count >= K:

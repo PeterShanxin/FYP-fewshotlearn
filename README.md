@@ -77,13 +77,21 @@ Construct a global prototype bank from the training split and evaluate queries a
    ```
    Outputs per-metric JSON to `results/global_metrics.json` and prints micro/macro precision/recall/F1, plus head/medium/tail bucket summaries based on training frequencies.
 
-3. **(Optional) Tune thresholds on a dev split**
+3. **(Optional) Tune thresholds via the calibration pipeline**
+
+   Set `eval.calibration.mode: only` in your config, then run
+
    ```bash
-   python scripts/tune_tau.py --config config.yaml --protos artifacts/prototypes.npz --split val \
-     --tau-min 0.2 --tau-max 0.6 --tau-step 0.02 --metric micro_f1 \
-     --out artifacts/calibration.json --per-class-out artifacts/per_ec_thresholds.json
+   bash scripts/run_all.sh config.yaml --calibrate-only
    ```
-   The resulting global `tau_multi` (in `calibration.json`) and optional per-EC overrides are consumed by both episodic (`src.eval_protonet`) and global-support evaluation. A top-1 fallback keeps at least one EC label whenever thresholds suppress every score.
+
+   This executes embedding → training → prototype building once per fold, writes `calibration.json` (and optional per-EC overrides) under `results/split-*/fold-*`, and copies tau/temperature curves to `results/figures`. Wrappers are available if you prefer not to edit the config in-place:
+
+   ```bash
+   python scripts/auto_tune_tau.py -c config.yaml --split val
+   ```
+
+   Both wrappers generate a temporary config with `eval.calibration.mode: only`, forward common CLI knobs (split, tau range, min precision/recall, per-class settings), and invoke `run_all.sh --calibrate-only` under the hood.
 
 ### One‑liners
 
@@ -152,7 +160,8 @@ Notes:
   - `python scripts/visualize_identity_benchmark.py --results_dir results --out_dir results/figures`
 
 - **Refresh calibration thresholds** – when metrics drift after retraining.
-  - `python scripts/auto_tune_tau.py -c config.yaml --split val --out artifacts/calibration.json --per-class-out artifacts/per_ec_thresholds.json`
+  - `bash scripts/run_all.sh config.yaml --calibrate-only` (optionally set `eval.calibration.mode: only`)
+  - or use `python scripts/auto_tune_tau.py -c config.yaml --split val`
 
 - **Run a quick smoke sanity test** – before long jobs or after major code changes.
   - `bash scripts/run_all.sh config.smoke.yaml`
@@ -176,8 +185,35 @@ See `config.yaml` for all knobs. Key defaults:
 - Multi-EC: `allow_multi_ec=true` (expand multi-EC rows)
 - Identity-aware episodes: `identity_disjoint=true` with clusters from `paths.clusters_tsv`
 - EC hierarchy: `hierarchy_levels=2`, `hierarchy_weight=0.2`
-- Multi-label thresholds: `tau_multi=0.60` (fallback) with tuned values loaded from `artifacts/calibration.json` and optional per-EC overrides from `artifacts/per_ec_thresholds.json`
+- Multi-label thresholds: `eval.tau_multi=0.35` by default (required; calibration JSON/per-EC overrides take precedence when present)
 - Random seed: `42`
+
+### Calibration knobs
+
+Toggle and tune calibration from the config instead of per-script flags:
+
+```yaml
+eval:
+  calibration:
+    mode: produce            # off | produce | only
+    split: train             # train_cal | train | val | test
+    tau_range: [0.2, 0.6, 0.02]
+    opt_temp: bce             # none | bce | brier
+    shortlist_topN: null      # null → reuse eval.shortlist_topN
+    plot_all: false
+    plot_metric: micro_f1
+    constraints:
+      min_precision: 0.10
+      min_recall: null
+    per_ec:
+      enable: false
+      mode: max_f1
+      target: null
+      shrink: 0.25
+      min_positives: 5
+```
+
+`run_all.sh --calibrate-only` overrides the config and runs calibration-only, emitting `calibration.json`, optional per-EC thresholds, and tau/temperature plots. Normal `run_all.sh` runs follow the config: `mode: off` (no calibration), `mode: produce` (produce calibration then proceed with evaluation and standard figures), `mode: only` (calibration-only; skip evaluation/visualization).
 
 Paths (relative):
 ```

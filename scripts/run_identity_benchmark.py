@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 from copy import deepcopy
 from pathlib import Path
@@ -23,9 +24,14 @@ from datetime import datetime
 
 # Lightweight status logger: append to RUNALL_STATUS_LOG if set
 def _status_log(message: str) -> None:
+    """Append a structured line to the configured status log.
+
+    When running as a nested calibration sub-run, also tee to the parent log
+    and append an optional scope tag for clarity (e.g., cutoff/fold).
+    """
     path = os.environ.get("RUNALL_STATUS_LOG")
-    if not path:
-        return
+    parent = os.environ.get("RUNALL_PARENT_STATUS_LOG")
+    scope_tag = os.environ.get("RUNALL_SCOPE_TAG")
     try:
         tzname = os.environ.get("RUNALL_TZ", "Asia/Singapore")
         try:
@@ -33,8 +39,16 @@ def _status_log(message: str) -> None:
             ts = datetime.now(ZoneInfo(tzname)).strftime("%Y-%m-%dT%H:%M:%S %Z")
         except Exception:
             ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(f"{ts} {message}\n")
+        suffix = f" {scope_tag}" if scope_tag else ""
+        if path:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(f"{ts} {message}{suffix}\n")
+        if parent and (not path or parent != path):
+            try:
+                with open(parent, "a", encoding="utf-8") as f2:
+                    f2.write(f"{ts} {message}{suffix}\n")
+            except Exception:
+                pass
     except Exception:
         # best-effort; never fail the run because logging failed
         pass
@@ -55,6 +69,129 @@ def dump_cfg(cfg: dict, path: Path) -> None:
         yaml.safe_dump(cfg, f, sort_keys=False)
 
 
+def _run_calibration(
+    cfg_path: Path,
+    outputs_path: Path,
+    *,
+    cutoff_pct: int,
+    fold_index: int,
+    calibration_cfg: Dict[str, Any],
+    calibrate_only: bool,
+    results_root: Path,
+    default_shortlist: int,
+) -> None:
+    """Invoke auto_tune_tau for the given fold and optionally surface plots."""
+
+    cmd: List[str] = [
+        "python",
+        "scripts/auto_tune_tau.py",
+        "--config",
+        str(cfg_path),
+    ]
+
+    split = str(calibration_cfg.get("split", "train"))
+    cmd.extend(["--split", split])
+
+    tau_range = calibration_cfg.get("tau_range")
+    if not (isinstance(tau_range, (list, tuple)) and len(tau_range) == 3):
+        tau_range = [0.2, 0.6, 0.02]
+    try:
+        tau_min, tau_max, tau_step = (float(tau_range[0]), float(tau_range[1]), float(tau_range[2]))
+    except Exception:
+        tau_min, tau_max, tau_step = 0.2, 0.6, 0.02
+    cmd.extend([
+        "--tau-min",
+        f"{tau_min:.6f}",
+        "--tau-max",
+        f"{tau_max:.6f}",
+        "--tau-step",
+        f"{tau_step:.6f}",
+    ])
+
+    opt_temp = str(calibration_cfg.get("opt_temp", "bce"))
+    cmd.extend(["--opt-temp", opt_temp])
+
+    shortlist_override = calibration_cfg.get("shortlist_topN")
+    shortlist_value: Optional[int]
+    if shortlist_override is None:
+        shortlist_value = default_shortlist
+    else:
+        try:
+            shortlist_value = int(shortlist_override)
+        except Exception:
+            shortlist_value = default_shortlist
+    if shortlist_value and shortlist_value > 0:
+        cmd.extend(["--shortlist", str(shortlist_value)])
+
+    constraints_cfg = calibration_cfg.get("constraints") or {}
+    min_precision = constraints_cfg.get("min_precision")
+    if min_precision is not None:
+        cmd.extend(["--min-precision", str(min_precision)])
+    min_recall = constraints_cfg.get("min_recall")
+    if min_recall is not None:
+        cmd.extend(["--min-recall", str(min_recall)])
+
+    plots_dir = outputs_path / "calibration_plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+
+    per_ec_cfg = calibration_cfg.get("per_ec") or {}
+    per_ec_enabled = bool(per_ec_cfg.get("enable", False))
+    per_ec_path = outputs_path / "per_ec_thresholds.json"
+    if per_ec_enabled:
+        cmd.extend(["--per-class-out", str(per_ec_path)])
+        mode = per_ec_cfg.get("mode")
+        if mode:
+            cmd.extend(["--per-class-mode", str(mode)])
+        target = per_ec_cfg.get("target")
+        if target is not None:
+            cmd.extend(["--per-class-target", str(target)])
+        shrink = per_ec_cfg.get("shrink")
+        if shrink is not None:
+            cmd.extend(["--per-class-shrink", str(shrink)])
+        min_pos = per_ec_cfg.get("min_positives")
+        if min_pos is not None:
+            cmd.extend(["--per-class-min-positives", str(min_pos)])
+
+    plot_all = calibration_cfg.get("plot_all")
+    if plot_all is None:
+        plot_all = calibrate_only
+    if plot_all:
+        cmd.append("--plot-all")
+    else:
+        plot_metric = str(calibration_cfg.get("plot_metric", "micro_f1"))
+        cmd.extend(["--plot-metric", plot_metric])
+    cmd.extend(["--plots-dir", str(plots_dir)])
+
+    _status_log(
+        f"phase=calibrate cutoff={cutoff_pct} fold={fold_index} event=start split={split} opt_temp={opt_temp}"
+    )
+    print(
+        f"[benchmark][calibrate] cutoff={cutoff_pct} fold={fold_index} split={split} opt_temp={opt_temp}"
+    )
+    try:
+        # Propagate a scope tag so nested run_all.sh can tee status lines back
+        # to the parent's log and annotate entries with cutoff/fold for clarity.
+        env = os.environ.copy()
+        env["RUNALL_SCOPE_TAG"] = f"scope=calibrate cutoff={cutoff_pct} fold={fold_index}"
+        subprocess.run(cmd, check=True, env=env)
+    except subprocess.CalledProcessError as exc:
+        _status_log(
+            f"phase=calibrate cutoff={cutoff_pct} fold={fold_index} event=finish status=failed exit_code={getattr(exc, 'returncode', 'NA')}"
+        )
+        raise
+    _status_log(
+        f"phase=calibrate cutoff={cutoff_pct} fold={fold_index} event=finish status=success"
+    )
+
+    if calibrate_only:
+        dest_dir = results_root / "figures"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        for plot in sorted(plots_dir.glob("*.png")):
+            dest_name = (
+                f"calibrate_cutoff{cutoff_pct}_fold{fold_index}_{plot.name}"
+            )
+            shutil.copy2(plot, dest_dir / dest_name)
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("-c", "--config", default="config.yaml")
@@ -62,6 +199,7 @@ def main() -> None:
     ap.add_argument("--folds", type=int, default=5)
     ap.add_argument("--skip_prepare", action="store_true", help="Assume splits already prepared")
     ap.add_argument("--force-embed", dest="force_embed", action="store_true", help="Recompute embeddings even if files exist")
+    ap.add_argument("--calibrate-only", action="store_true", help="Run calibration-only workflow and skip downstream evaluation")
     args = ap.parse_args()
 
     base_cfg = load_cfg(args.config)
@@ -80,6 +218,18 @@ def main() -> None:
     out_root = Path(base_cfg["paths"].get("outputs", "results")).resolve()
     results_root = out_root
     results_root.mkdir(parents=True, exist_ok=True)
+
+    # Respect calibrate-only from CLI or config mode
+    # Read calibration mode from the base config
+    cal_mode = str(((base_cfg.get("eval") or {}).get("calibration") or {}).get("mode", "off")).lower()
+    cfg_calibrate_only = cal_mode == "only"
+    effective_calibrate_only = bool(args.calibrate_only or cfg_calibrate_only)
+
+    if effective_calibrate_only:
+        figures_dir = results_root / "figures"
+        if figures_dir.exists():
+            shutil.rmtree(figures_dir)
+        figures_dir.mkdir(parents=True, exist_ok=True)
 
     if not args.skip_prepare:
         run(["python", "scripts/prepare_identity_splits.py", "-c", args.config, "--cutoffs", args.cutoffs, "--folds", str(args.folds)])
@@ -129,6 +279,17 @@ def main() -> None:
 
             eval_cfg = dict(run_cfg.get("eval") or {})
             outputs_path = Path(run_cfg["paths"]["outputs"]).resolve()
+            outputs_dir = outputs_path
+            default_shortlist = int(eval_cfg.get("shortlist_topN", 0))
+            calibration_cfg = dict(eval_cfg.get("calibration") or {})
+            per_ec_cfg = dict(calibration_cfg.get("per_ec") or {})
+            calibration_cfg["per_ec"] = per_ec_cfg
+            constraints_cfg = dict(calibration_cfg.get("constraints") or {})
+            calibration_cfg["constraints"] = constraints_cfg
+            per_ec_enabled = bool(per_ec_cfg.get("enable", False))
+            metrics_path = outputs_path / "metrics.json"
+            global_metrics_path = outputs_path / "global_metrics.json"
+            calibration_path_file = outputs_path / "calibration.json"
             proto_path = None
             if run_global:
                 proto_path = outputs_path / "prototypes.npz"
@@ -137,10 +298,66 @@ def main() -> None:
                 # prototypes written for this split instead of any global default.
                 eval_cfg["prototypes_path"] = str(proto_path)
                 eval_cfg["calibration_path"] = str(calib_path)
+            if per_ec_enabled:
+                eval_cfg["per_ec_thresholds_path"] = str((outputs_path / "per_ec_thresholds.json").resolve())
+            eval_cfg["calibration"] = calibration_cfg
             run_cfg["eval"] = eval_cfg
+            mode_val = str(calibration_cfg.get("mode", "off")).lower()
+            calibration_requested = bool(args.calibrate_only or mode_val in {"produce", "only"})
             # Create temp config
             cfg_path = tmp_cfg_dir / f"run_id{pct}_fold{fi+1}.yaml"
             dump_cfg(run_cfg, cfg_path)
+
+            # Resume logic: skip completed folds when rerunning
+            if effective_calibrate_only and calibration_requested and calibration_path_file.exists():
+                print(
+                    f"[benchmark][resume] cutoff={pct} fold={fi+1}: calibration artifacts already present; skipping."
+                )
+                _status_log(
+                    f"phase=calibrate cutoff={pct} fold={fi+1} event=skip reason=resume_existing"
+                )
+                dest_dir = results_root / "figures"
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                source_dir = outputs_path / "calibration_plots"
+                if source_dir.exists():
+                    for plot in sorted(source_dir.glob("*.png")):
+                        dest_name = f"calibrate_cutoff{pct}_fold{fi+1}_{plot.name}"
+                        try:
+                            shutil.copy2(plot, dest_dir / dest_name)
+                        except Exception:
+                            pass
+                continue
+
+            if (
+                not effective_calibrate_only
+                and ((not calibration_requested) or calibration_path_file.exists())
+            ):
+                evaluation_done = True
+                if run_episodic and not metrics_path.exists():
+                    evaluation_done = False
+                if run_global and not global_metrics_path.exists():
+                    evaluation_done = False
+                if evaluation_done:
+                    print(
+                        f"[benchmark][resume] cutoff={pct} fold={fi+1}: existing metrics detected; skipping retrain."
+                    )
+                    _status_log(
+                        f"phase=train cutoff={pct} fold={fi+1} event=skip reason=resume_existing"
+                    )
+                    if calibration_requested:
+                        _status_log(
+                            f"phase=calibrate cutoff={pct} fold={fi+1} event=skip reason=resume_existing"
+                        )
+                    _status_log(
+                        f"phase=eval cutoff={pct} fold={fi+1} event=skip reason=resume_existing"
+                    )
+                    try:
+                        with open(metrics_path, "r", encoding="utf-8") as fh:
+                            enriched = json.load(fh)
+                        per_fold_metrics.append(enriched)
+                    except Exception:
+                        pass
+                    continue
 
             # Train + eval
             # Ensure embeddings exist (contiguous files) before training
@@ -228,6 +445,19 @@ def main() -> None:
                         f"phase=prototypes cutoff={pct} fold={fi+1} event=finish status=failed exit_code={getattr(e, 'returncode', 'NA')}"
                     )
                     raise
+            if run_global and calibration_requested:
+                _run_calibration(
+                    cfg_path,
+                    outputs_path,
+                    cutoff_pct=pct,
+                    fold_index=fi + 1,
+                    calibration_cfg=calibration_cfg,
+                    calibrate_only=effective_calibrate_only,
+                    results_root=results_root,
+                    default_shortlist=default_shortlist,
+                )
+                if effective_calibrate_only:
+                    continue
             # Skip eval if test split has no classes
             test_jsonl = Path(run_cfg["paths"]["splits_dir"]) / "test.jsonl"
             nonempty = False
@@ -236,9 +466,6 @@ def main() -> None:
                     for _ in f:
                         nonempty = True
                         break
-            outputs_dir = Path(run_cfg["paths"]["outputs"])
-            metrics_path = outputs_dir / "metrics.json"
-            global_metrics_path = outputs_dir / "global_metrics.json"
 
             eval_commands: List[Tuple[str, List[str]]] = []
             if run_episodic:
@@ -487,6 +714,9 @@ def main() -> None:
                 json.dump(enriched, f, indent=2)
             per_fold_metrics.append(enriched)
 
+        if effective_calibrate_only:
+            continue
+
         agg: Dict[str, Any] = {}
 
         episodic_records = [rec.get("metrics", {}).get("episodic") for rec in per_fold_metrics if rec.get("metrics", {}).get("episodic")]
@@ -561,6 +791,10 @@ def main() -> None:
         }
 
     # Write summary across thresholds
+    if effective_calibrate_only:
+        print("[benchmark] Calibrate-only mode complete; skipping summary aggregation.")
+        return
+
     bench_path = results_root / "summary_by_id_threshold.json"
     with open(bench_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)

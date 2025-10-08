@@ -7,13 +7,18 @@ set -euo pipefail
 
 CFG="config.yaml"
 FORCE_EMBED=0
+CALIBRATE_ONLY=0
+# Track if we were terminated by a signal for accurate exit reporting
+TERM_SIGNAL=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --force-embed) FORCE_EMBED=1 ;;
+    --calibrate-only) CALIBRATE_ONLY=1 ;;
     -h|--help)
       cat <<EOF
 Usage: bash scripts/run_all.sh [config.yaml] [--force-embed]
   --force-embed  Recompute embeddings even if existing files are found
+  --calibrate-only  Run calibration-only flow (skip visualization)
 EOF
       exit 0
       ;;
@@ -29,6 +34,10 @@ completed=0
 
 STATUS_LOG=""
 LOG_DIR=""
+# Capture parent status log (if any) before we override RUNALL_STATUS_LOG
+PARENT_STATUS_LOG="${RUNALL_STATUS_LOG:-}"
+# Optional tag propagated by parent to describe nested scope (e.g., calibration fold/cutoff)
+RUNALL_SCOPE_TAG="${RUNALL_SCOPE_TAG:-}"
 declare -A PHASE_STARTS=()
 CURRENT_PHASE=""
 
@@ -40,8 +49,16 @@ timestamp() {
 
 log_line() {
   local message=$1
+  local tag_suffix=""
+  if [ -n "${RUNALL_SCOPE_TAG:-}" ]; then
+    tag_suffix=" ${RUNALL_SCOPE_TAG}"
+  fi
   if [ -n "${STATUS_LOG:-}" ]; then
-    printf "%s %s\n" "$(timestamp)" "$message" >> "$STATUS_LOG"
+    printf "%s %s%s\n" "$(timestamp)" "$message" "$tag_suffix" >> "$STATUS_LOG"
+  fi
+  # Also tee to parent status log (if present and different) to avoid gaps during nested runs
+  if [ -n "${PARENT_STATUS_LOG:-}" ] && [ "${PARENT_STATUS_LOG}" != "${STATUS_LOG}" ]; then
+    printf "%s %s%s\n" "$(timestamp)" "$message" "$tag_suffix" >> "$PARENT_STATUS_LOG" || true
   fi
 }
 
@@ -71,6 +88,17 @@ phase_complete() {
 # Always print total runtime on exit (success or failure)
 on_exit() {
   local status=$?
+  # If a terminating signal occurred, normalize the exit code to 128+signum
+  # and record it so logs/readers see a non-zero failure instead of 0.
+  if [ -n "$TERM_SIGNAL" ]; then
+    case "$TERM_SIGNAL" in
+      SIGINT)  status=130 ;;
+      SIGHUP)  status=129 ;;
+      SIGQUIT) status=131 ;;
+      SIGTERM) status=143 ;;
+      *)       status=1   ;;
+    esac
+  fi
   local end_time=$(date +%s)
   local elapsed=$((end_time - start_time))
   local hours=$((elapsed / 3600))
@@ -78,30 +106,49 @@ on_exit() {
   local secs=$((elapsed % 60))
 
   if [ -n "${STATUS_LOG:-}" ]; then
-    if [ "$status" -eq 0 ] && [ "$completed" -eq 1 ]; then
+    # Log any unfinished current phase as failed when exiting non-zero
+    if [ "$status" -ne 0 ] && [ -n "${CURRENT_PHASE:-}" ]; then
+      local phase_elapsed=0
+      local signal_note=""
+      if [ -n "${PHASE_STARTS[$CURRENT_PHASE]:-}" ]; then
+        phase_elapsed=$((end_time - PHASE_STARTS[$CURRENT_PHASE]))
+      fi
+      if [ -n "$TERM_SIGNAL" ]; then
+        signal_note=" signal=${TERM_SIGNAL}"
+      fi
+      log_line "phase=${CURRENT_PHASE} event=failed exit_code=${status}${signal_note} duration_seconds=${phase_elapsed}"
+    fi
+    # Always emit a pipeline completion line with accurate status/exit_code
+    if [ -n "$TERM_SIGNAL" ]; then
+      log_line "pipeline event=completed status=failure reason=terminated signal=${TERM_SIGNAL} exit_code=${status} total_seconds=${elapsed}"
+    elif [ "$status" -eq 0 ]; then
       log_line "pipeline event=completed status=success total_seconds=${elapsed}"
     else
-      local phase_elapsed=0
-      if [ -n "${CURRENT_PHASE:-}" ]; then
-        local start=${PHASE_STARTS[$CURRENT_PHASE]:-}
-        if [ -n "$start" ]; then
-          phase_elapsed=$((end_time - start))
-        fi
-        log_line "phase=${CURRENT_PHASE} event=failed exit_code=${status} duration_seconds=${phase_elapsed}"
-      fi
       log_line "pipeline event=completed status=failure exit_code=${status} total_seconds=${elapsed}"
     fi
   fi
 
-  if [ "$completed" -eq 1 ] && [ "$status" -eq 0 ]; then
+  # Console summary: treat status==0 as success regardless of 'completed'
+  if [ "$status" -eq 0 ]; then
     printf "[run_all] Done. Check results/ for outputs.\n"
   else
-    printf "[run_all] Failed with exit code %d.\n" "$status" >&2
+    if [ -n "$TERM_SIGNAL" ]; then
+      printf "[run_all] Terminated (%s). Exit code %d.\n" "$TERM_SIGNAL" "$status" >&2
+    else
+      printf "[run_all] Failed with exit code %d.\n" "$status" >&2
+    fi
   fi
   printf "[run_all] Total runtime: %02dh:%02dm:%02ds\n" "$hours" "$mins" "$secs"
   exit "$status"
 }
 trap on_exit EXIT
+
+# Record terminating signals explicitly so EXIT trap can report accurately
+mark_signal() { TERM_SIGNAL="$1"; }
+trap 'mark_signal SIGINT'  INT
+trap 'mark_signal SIGHUP'  HUP
+trap 'mark_signal SIGQUIT' QUIT
+trap 'mark_signal SIGTERM' TERM
 
 # Auto-activate local venv if present and not already active
 if [ -z "${VIRTUAL_ENV:-}" ] && [ -d ".venv" ]; then
@@ -130,9 +177,16 @@ PY
 LOG_DIR="${RESULTS_DIR}/logs"
 STATUS_LOG="${LOG_DIR}/run_all_status.log"
 mkdir -p "$LOG_DIR"
-: > "$STATUS_LOG"
+# Avoid truncating the parent's status log if nested and pointing to the same path
+if [ -z "${PARENT_STATUS_LOG:-}" ] || [ "${PARENT_STATUS_LOG}" != "${STATUS_LOG}" ]; then
+  : > "$STATUS_LOG"
+fi
 # Expose status log to subprocesses (Python) so they can append detailed phase logs
 export RUNALL_STATUS_LOG="$STATUS_LOG"
+# Also pass parent status log to Python helpers so they can tee entries
+if [ -n "${PARENT_STATUS_LOG:-}" ] && [ "${PARENT_STATUS_LOG}" != "${STATUS_LOG}" ]; then
+  export RUNALL_PARENT_STATUS_LOG="$PARENT_STATUS_LOG"
+fi
 # Keep timezone consistent with bash logger
 export RUNALL_TZ="Asia/Singapore"
 TOPUP_SUMMARY_JSON="${LOG_DIR}/trembl_topup_summary.json"
@@ -191,6 +245,16 @@ if [ -n "${MODULES}" ]; then
     log_line "modules event=skipped reason=command_unavailable"
   fi
 fi
+
+require_command() {
+  local cmd=$1
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "[run_all][error] Required command '$cmd' not found on PATH. Ensure relevant modules are loaded before running." >&2
+    exit 19
+  fi
+}
+
+require_command mmseqs
 
 FORCE_FETCH=$(python - "${CFG}" <<'PY'
 import sys, yaml
@@ -434,10 +498,20 @@ if [ "${TOPUP_ENABLED}" = "true" ]; then
 fi
 
 phase_begin "benchmark"
-python scripts/run_identity_benchmark.py -c "${CFG}" --cutoffs "${CUTOFFS}" --folds "${FOLDS}" ${FE_FLAG} ${SKIP_PREPARE_FLAG}
-log_line "phase=benchmark detail=run_identity_benchmark status=success"
+if [ "${CALIBRATE_ONLY}" -eq 1 ]; then
+  CAL_FLAG="--calibrate-only"
+else
+  CAL_FLAG=""
+fi
+python scripts/run_identity_benchmark.py -c "${CFG}" --cutoffs "${CUTOFFS}" --folds "${FOLDS}" ${FE_FLAG} ${SKIP_PREPARE_FLAG} ${CAL_FLAG}
+if [ "${CALIBRATE_ONLY}" -eq 1 ]; then
+  log_line "phase=benchmark detail=run_identity_benchmark status=success mode=calibrate_only"
+else
+  log_line "phase=benchmark detail=run_identity_benchmark status=success"
+fi
 phase_complete "benchmark"
 
+if [ "${CALIBRATE_ONLY}" -eq 0 ]; then
 phase_begin "visualize"
 OUT_FIG_DIR="${RESULTS_DIR}/figures"
 LASTRUN_DIR="${RESULTS_DIR}/lastrun"
@@ -509,5 +583,57 @@ PY
   fi
 fi
 phase_complete "visualize" "$VIS_STATUS"
+else
+  echo "[run_all] Calibrate-only mode: skipping visualization stage"
+  log_line "phase=visualize status=skipped reason=calibrate_only"
+fi
 
 completed=1
+# Detect config-driven calibrate-only mode so we can skip visualization too
+CAL_MODE=$(python - "${CFG}" <<'PY'
+import sys, yaml
+cfg = yaml.safe_load(open(sys.argv[1], 'r', encoding='utf-8')) or {}
+mode = (((cfg.get('eval') or {}).get('calibration') or {}).get('mode') or 'off')
+print(str(mode).lower())
+PY
+)
+if [ "$CALIBRATE_ONLY" -eq 0 ] && [ "$CAL_MODE" = "only" ]; then
+  CALIBRATE_ONLY=1
+fi
+
+# Ensure eval.tau_multi is provided (no implicit fallback)
+TAU_CHECK=$(python - "${CFG}" <<'PY'
+import sys, yaml
+cfg = yaml.safe_load(open(sys.argv[1], 'r', encoding='utf-8')) or {}
+eval_cfg = cfg.get('eval') or {}
+tau = eval_cfg.get('tau_multi')
+print('ok' if tau is not None else 'missing')
+PY
+)
+if [ "$TAU_CHECK" != "ok" ]; then
+  echo "[run_all][error] Missing eval.tau_multi in ${CFG}. Set a base threshold before running." >&2
+  exit 17
+fi
+
+# Validate calibration configuration when enabled
+CAL_CHECK=$(python - "${CFG}" <<'PY'
+import sys, yaml
+cfg = yaml.safe_load(open(sys.argv[1], 'r', encoding='utf-8')) or {}
+cal = (cfg.get('eval') or {}).get('calibration') or {}
+mode = str(cal.get('mode', 'off')).lower()
+if mode not in {'produce', 'only'}:
+    print('ok')
+    raise SystemExit
+errors = []
+tau_range = cal.get('tau_range')
+if not isinstance(tau_range, (list, tuple)) or len(tau_range) != 3:
+    errors.append('tau_range')
+if cal.get('split') in (None, ''):
+    errors.append('split')
+print('ok' if not errors else ','.join(errors))
+PY
+)
+if [ "$CAL_CHECK" != "ok" ]; then
+  echo "[run_all][error] Calibration mode requires valid settings. Missing or invalid: ${CAL_CHECK}" >&2
+  exit 18
+fi

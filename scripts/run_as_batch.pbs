@@ -19,7 +19,7 @@
 # Route queue; scheduler sends job to GPU partition
 #PBS -l select=1:ncpus=8:ngpus=1:mem=64GB
 # 1 node, 1 GPU, 8 CPUs, 64GB RAM
-#PBS -l walltime=24:00:00
+#PBS -l walltime=12:00:00
 # Max runtime (HH:MM:SS)
 #PBS -j oe
 # Join stdout/stderr into one stream

@@ -70,6 +70,9 @@ slurm-*.err
 slurm-*.log
 nohup.out
 logs/
+# PBS/Torque job logs (stdout/stderr)
+*.o[0-9]*
+*.e[0-9]*
 
 # Optional experiment trackers (if used)
 wandb/

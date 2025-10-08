@@ -9,6 +9,23 @@ embedding:
 # Force CPU for widest compatibility in CI/smoke
 device: cpu
 
+# Optional: load HPC environment modules before running (for MMseqs2)
+modules:
+  - MMseqs2
+
+# Make smoke runs self-contained and fast: avoid network during top-up
+trembl_topup:
+  enable: true
+  offline: true           # use cached data only for smoke
+  cache_dir: data/uniprot_ec/trembl_cache_smoke
+  per_ec_cap: 3
+  overshoot: 1
+  refresh_days: 7
+  concurrency: 2
+  rps: 4.0
+  timeout: 60
+  max_ecs: 5
+
 # Keep episodes extremely small for speed
 episode:
   M_train: 1
@@ -44,24 +61,13 @@ multi_label: true
 hierarchy_levels: 1
 hierarchy_weight: 0.2
 allow_multi_ec: true
-tau_multi: 0.60
 
 # Ensure splits are built from Swiss-Prot only when using a merged joined TSV
 split_source: SwissProt
 
-trembl_topup:
-  enable: true
-  cache_dir: data/uniprot_ec/trembl_cache_smoke
-  per_ec_cap: 3
-  overshoot: 1
-  refresh_days: 7
-  concurrency: 2
-  rps: 4.0
-  timeout: 60
-  max_ecs: 10
 
 sampler:
-  identity_disjoint: true
+  identity_disjoint: false       # allow smoke runs with single-cluster classes
   with_replacement_fallback: true
   fallback_scope: all
   rare_class_boost: inverse_log_freq
@@ -78,15 +84,32 @@ eval:
   prototypes_path: artifacts/prototypes_smoke.npz
   calibration_path: artifacts/calibration_smoke.json
   split: val
+  calibration:
+    mode: off
+    split: train
+    tau_range: [0.2, 0.4, 0.05]
+    opt_temp: bce
+    shortlist_topN: null
+    plot_all: false
+    plot_metric: micro_f1
+    constraints:
+      min_precision: 0.05
+      min_recall: null
+    per_ec:
+      enable: false
+      mode: max_f1
+      target: null
+      shrink: 0.25
+      min_positives: 3
 
 # Clustering defaults (auto)
 cluster_identity: 0.5
 cluster_coverage: 0.5
 
-# Identity benchmark defaults for smoke (fast)
-# Required: list of one or more thresholds (percent or fractions)
-id_thresholds: [10, 50, 100]
-folds: 3
+# Identity benchmark for smoke: single threshold and fewer folds
+# Accepts percent or fraction values
+id_thresholds: [50]
+folds: 2
 identity_definition: tool_default
 clustering_method: existing_id_cluster_module
 stratify_by: EC_top

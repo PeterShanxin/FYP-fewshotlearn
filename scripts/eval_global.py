@@ -32,7 +32,7 @@ def main() -> None:
         "--calibration",
         type=Path,
         default=Path("artifacts/calibration.json"),
-        help="Calibration JSON from tune_tau (defaults to artifacts/calibration.json)",
+        help="Calibration JSON (defaults to artifacts/calibration.json)",
     )
     args = ap.parse_args()
 

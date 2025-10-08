@@ -1,837 +1,334 @@
 #!/usr/bin/env python
 from __future__ import annotations
 
-"""
-Auto-tune global-support thresholds with minimal friction.
+"""Calibrate global-support thresholds without relaunching the full pipeline.
 
-What it does:
-- Locates or optionally builds a prototype bank.
-- Picks a calibration split automatically (train_cal → train → val → test) that has coverage.
-- Grid-searches tau (and optionally temperature) and writes a calibration JSON.
-- Emits a CSV report of tau/temperature vs metrics and prints a compact summary.
+This wrapper is invoked by run_identity_benchmark.py for each (cutoff, fold)
+to generate calibration artifacts in-place. It performs:
+  - Optional temperature calibration (opt_temp: none|bce|brier)
+  - Grid search of metric vs tau over the requested range
+  - Writes calibration.json under the current fold's outputs directory
+  - Optionally emits simple plots under a provided plots dir
 
-Typical usage:
-  python scripts/auto_tune_tau.py --config config.yaml
-  python scripts/auto_tune_tau.py --config .tmp_configs/run_id50_fold1.yaml
-
-Outputs (by default):
-- Calibration JSON next to the configured eval.calibration_path
-- CSV report next to the calibration file (tune_report.csv)
+It intentionally does not call scripts/run_all.sh to avoid recursive relaunches.
 """
 
 import argparse
-import csv
 import json
+import math
+import uuid
+from copy import deepcopy
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
+import yaml
 import numpy as np
 import torch
-import torch.nn.functional as F
-
-# Ensure repo root on sys.path for src.* imports
 import sys
 
+# Ensure repository root is on sys.path for 'src' imports
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.eval_global import GlobalSupportEvaluator, _load_thresholds  # type: ignore
-from src.model_utils import build_model, infer_input_dim, load_checkpoint, load_cfg, pick_device  # type: ignore
-from src.prototype_bank import build_prototypes, save_prototypes, load_prototypes  # type: ignore
-import subprocess
+# Import evaluator directly to avoid re-running the pipeline
+from src.eval_global import GlobalSupportEvaluator
+from src.model_utils import load_cfg as load_yaml_cfg, pick_device
 
 
-MetricKeys = Tuple[str, str, str, str, str]
+TMP_DIR = Path(".tmp_configs")
+
+
+def load_cfg(path: Path) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as handle:
+        data = yaml.safe_load(handle)
+    return data or {}
+
+
+def write_cfg(cfg: Dict[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(cfg, handle, sort_keys=False)
+
+
+def _resolve_calibration_cfg(cfg: Dict[str, Any], args: argparse.Namespace) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Return (eval_cfg, cal_cfg) merged with CLI overrides."""
+    eval_cfg = dict(cfg.get("eval") or {})
+    cal_cfg = dict(eval_cfg.get("calibration") or {})
+
+    if args.split:
+        cal_cfg["split"] = args.split
+
+    existing_range = cal_cfg.get("tau_range") or [0.2, 0.6, 0.02]
+    tau_min = args.tau_min if args.tau_min is not None else existing_range[0]
+    tau_max = args.tau_max if args.tau_max is not None else existing_range[1]
+    tau_step = args.tau_step if args.tau_step is not None else existing_range[2]
+    cal_cfg["tau_range"] = [float(tau_min), float(tau_max), float(tau_step)]
+
+    if args.opt_temp is not None:
+        cal_cfg["opt_temp"] = args.opt_temp
+
+    if args.shortlist is not None:
+        eval_cfg["shortlist_topN"] = int(args.shortlist)
+
+    constraints = dict(cal_cfg.get("constraints") or {})
+    if args.min_precision is not None:
+        constraints["min_precision"] = float(args.min_precision)
+    if args.min_recall is not None:
+        constraints["min_recall"] = float(args.min_recall)
+    cal_cfg["constraints"] = constraints
+
+    per_ec_cfg = dict(cal_cfg.get("per_ec") or {})
+    if args.enable_per_class or args.per_class_mode or args.per_class_target is not None:
+        per_ec_cfg["enable"] = True
+    if args.per_class_mode:
+        per_ec_cfg["mode"] = args.per_class_mode
+    if args.per_class_target is not None:
+        per_ec_cfg["target"] = float(args.per_class_target)
+    if args.per_class_shrink is not None:
+        per_ec_cfg["shrink"] = float(args.per_class_shrink)
+    if args.per_class_min_positives is not None:
+        per_ec_cfg["min_positives"] = int(args.per_class_min_positives)
+    cal_cfg["per_ec"] = per_ec_cfg
+
+    if args.plot_all:
+        cal_cfg["plot_all"] = True
+        cal_cfg.pop("plot_metric", None)
+    elif args.plot_metric:
+        cal_cfg["plot_all"] = False
+        cal_cfg["plot_metric"] = args.plot_metric
+    else:
+        # Default to plotting only the primary metric when invoked by the benchmark
+        cal_cfg.setdefault("plot_all", False)
+        cal_cfg.setdefault("plot_metric", "micro_f1")
+
+    if args.plots_dir is not None:
+        cal_cfg["plots_dir"] = str(args.plots_dir)
+
+    eval_cfg["calibration"] = cal_cfg
+    return eval_cfg, cal_cfg
+
+
+def _temperature_grid(base: float) -> np.ndarray:
+    base = max(1e-3, float(base))
+    lo = max(1e-2, base / 10.0)
+    hi = min(100.0, base * 10.0)
+    # Use a compact log-spaced grid; refine only if needed
+    return np.unique(np.clip(np.geomspace(lo, hi, num=25), 1e-3, 1e3))
+
+
+@torch.no_grad()
+def _optimize_temperature(
+    logits: torch.Tensor,
+    y_true: np.ndarray,
+    method: str,
+    base_temp: float,
+) -> Tuple[float, Dict[str, List[float]]]:
+    """Return (best_temperature, curve) for BCE/Brier over a 1-D grid.
+
+    curve contains the evaluated temperatures and losses for optional plotting.
+    """
+    y = torch.from_numpy(y_true.astype(np.float32))
+    temps = _temperature_grid(base_temp)
+    losses: List[float] = []
+    eps = 1e-7
+    for T in temps:
+        p = torch.sigmoid(logits / float(T))
+        if method == "brier":
+            loss = torch.mean((p - y) ** 2)
+        else:  # "bce"
+            loss = -torch.mean(y * torch.log(p.clamp(min=eps)) + (1 - y) * torch.log((1 - p).clamp(min=eps)))
+        losses.append(float(loss.cpu().item()))
+    idx = int(np.argmin(losses))
+    return float(temps[idx]), {"temperatures": [float(t) for t in temps], "loss": losses}
 
 
 def _frange(start: float, stop: float, step: float) -> List[float]:
-    values: List[float] = []
-    current = start
-    while current <= stop + 1e-9:
-        values.append(round(current, 6))
-        current += step
-    return values
-
-
-def _parse_bool_flag(value: Optional[str]) -> Optional[bool]:
-    if value is None:
-        return None
-    lowered = value.lower()
-    if lowered not in {"true", "false"}:
-        raise argparse.ArgumentTypeError("Expected 'true' or 'false'")
-    return lowered == "true"
-
-
-def _resolve_metric_keys(metric: str, bucket: str) -> MetricKeys:
-    if bucket != "overall" and metric == "acc_top1_hit":
-        raise ValueError("acc_top1_hit objective is only available for the overall bucket")
-
-    def _bucketize(name: str) -> str:
-        return name if bucket == "overall" else f"{bucket}_{name}"
-
-    primary = metric if bucket == "overall" else _bucketize(metric)
-
-    if metric == "micro_f1":
-        tie1 = _bucketize("macro_f1")
-        tie2 = "acc_top1_hit"
-    elif metric == "macro_f1":
-        tie1 = _bucketize("micro_f1")
-        tie2 = "acc_top1_hit"
-    else:  # acc_top1_hit
-        tie1 = _bucketize("micro_f1")
-        tie2 = _bucketize("macro_f1")
-
-    precision_key = _bucketize("micro_precision")
-    recall_key = _bucketize("micro_recall")
-    return primary, tie1, tie2, precision_key, recall_key
-
-
-def _compute_per_class_thresholds(
-    evaluator: GlobalSupportEvaluator,
-    *,
-    temperature: float,
-    tau_grid: Sequence[float],
-    shortlist: int,
-    ensure_top1: bool,
-    global_tau: float,
-    shrink: float,
-    min_positives: int,
-    mode: str,
-    target: Optional[float],
-) -> Dict[str, float]:
-    """Compute per-EC thresholds using the evaluator's logits/targets.
-
-    Matches the approach used by scripts/tune_tau.py.
-    """
-    num_classes = evaluator.num_classes
-    if num_classes == 0:
-        return {}
-
-    if not tau_grid:
-        tau_grid = [global_tau]
-
-    probs = torch.sigmoid(evaluator.class_logits / float(temperature))
-    if probs.shape[0] == 0:
-        adjusted = float((1.0 - shrink) * global_tau + shrink * global_tau)
-        return {ec: round(adjusted, 6) for ec in evaluator.class_names}
-
-    y_true_np = evaluator.y_true.astype(np.bool_)
-    positives = y_true_np.sum(axis=0)
-
-    if shortlist > 0 and shortlist < num_classes:
-        topk = torch.topk(probs, k=shortlist, dim=1)
-        mask = torch.zeros_like(probs, dtype=torch.bool)
-        mask.scatter_(1, topk.indices, True)
-    else:
-        mask = torch.ones_like(probs, dtype=torch.bool)
-
-    top1_idx = probs.argmax(dim=1)
-
-    stats_per_tau: List[Dict[str, np.ndarray]] = []
-    tau_candidates = sorted({round(float(t), 6) for t in tau_grid})
-
-    for tau in tau_candidates:
-        decisions = (probs >= tau) & mask
-        if ensure_top1:
-            no_positive = decisions.sum(dim=1) == 0
-            if torch.any(no_positive):
-                decisions[no_positive, top1_idx[no_positive]] = True
-        preds_np = decisions.cpu().numpy().astype(bool)
-
-        tp = np.sum(preds_np & y_true_np, axis=0)
-        fp = np.sum(preds_np & (~y_true_np), axis=0)
-        fn = np.sum((~preds_np) & y_true_np, axis=0)
-
-        denom_prec = tp + fp
-        denom_rec = tp + fn
-        denom_f1 = 2 * tp + fp + fn
-
-        precision = np.divide(tp, denom_prec, out=np.zeros_like(tp, dtype=float), where=denom_prec > 0)
-        recall = np.divide(tp, denom_rec, out=np.zeros_like(tp, dtype=float), where=denom_rec > 0)
-        f1 = np.divide(2 * tp, denom_f1, out=np.zeros_like(tp, dtype=float), where=denom_f1 > 0)
-
-        stats_per_tau.append(
-            {
-                "tau": float(tau),
-                "precision": precision,
-                "recall": recall,
-                "f1": f1,
-            }
-        )
-
-    per_class: Dict[str, float] = {}
-    stats_lookup = {stats["tau"]: stats for stats in stats_per_tau}
-    shrink = float(np.clip(shrink, 0.0, 1.0))
-
-    for idx, ec in enumerate(evaluator.class_names):
-        if positives[idx] < min_positives:
-            tau_choice = global_tau
-        else:
-            tau_choice: Optional[float] = None
-            if mode == "max_f1":
-                best_score = -1.0
-                for stats in stats_per_tau:
-                    score = float(stats["f1"][idx])
-                    if score > best_score + 1e-12:
-                        best_score = score
-                        tau_choice = stats["tau"]
-            elif mode == "precision_at":
-                if target is None:
-                    raise ValueError("per-class-target must be provided for precision_at mode")
-                for tau in tau_candidates:
-                    stats = stats_lookup[tau]
-                    if float(stats["precision"][idx]) >= target - 1e-12:
-                        tau_choice = tau
-                        break
-            elif mode == "recall_at":
-                if target is None:
-                    raise ValueError("per-class-target must be provided for recall_at mode")
-                for tau in reversed(tau_candidates):
-                    stats = stats_lookup[tau]
-                    if float(stats["recall"][idx]) >= target - 1e-12:
-                        tau_choice = tau
-                        break
-            else:
-                raise ValueError(f"Unsupported per-class mode: {mode}")
-
-            if tau_choice is None:
-                tau_choice = global_tau
-
-        adjusted = (1.0 - shrink) * float(tau_choice) + shrink * float(global_tau)
-        adjusted = max(0.0, min(adjusted, 1.0))
-        per_class[ec] = round(float(adjusted), 6)
-
-    return per_class
-
-
-def _optimize_temperature(
-    evaluator: GlobalSupportEvaluator,
-    loss_type: str,
-    *,
-    default_temperature: float,
-) -> Tuple[float, List[Dict[str, float]]]:
-    logits = evaluator.class_logits
-    if logits.numel() == 0:
-        return default_temperature, []
-
-    y_true = torch.from_numpy(evaluator.y_true).to(dtype=logits.dtype)
-    temps = torch.arange(0.03, 0.1501, 0.002)
-    history: List[Dict[str, float]] = []
-
-    best_temp = default_temperature
-    best_loss = float("inf")
-    for temp in temps:
-        probs = torch.sigmoid(logits / temp)
-        if loss_type == "bce":
-            loss = F.binary_cross_entropy(probs, y_true, reduction="mean").item()
-        else:
-            loss = torch.mean((probs - y_true) ** 2).item()
-        history.append({"temperature": float(temp.item()), "loss": float(loss)})
-        if loss < best_loss - 1e-12:
-            best_loss = loss
-            best_temp = float(temp.item())
-    return best_temp, history
-
-
-def _choose_split_with_coverage(
-    cfg: dict,
-    prototypes_path: Path,
-    candidates: Sequence[str],
-) -> Optional[str]:
-    """Pick first split that has at least one accession with an EC present in prototypes."""
-    try:
-        protos, _ = load_prototypes(prototypes_path)
-    except Exception:
-        return None
-    if not protos:
-        return None
-    proto_ecs = set(protos.keys())
-    splits_dir = Path(cfg["paths"]["splits_dir"]) if cfg.get("paths") else None
-    if not splits_dir:
-        return None
-
-    def _covered_accessions(jsonl: Path) -> int:
-        if not jsonl.exists():
-            return 0
-        count = 0
-        with open(jsonl, "r", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    obj = json.loads(line)
-                except Exception:
-                    continue
-                ec = str(obj.get("ec", ""))
-                if ec in proto_ecs:
-                    accs = obj.get("accessions", [])
-                    if isinstance(accs, list):
-                        count += len(accs)
-        return count
-
-    for name in candidates:
-        path = Path(splits_dir) / f"{name}.jsonl"
-        if _covered_accessions(path) > 0:
-            return name
-    return None
-
-
-def _ensure_splits(
-    cfg: dict,
-    *,
-    prepare_if_missing: bool,
-    config_path: Path,
-) -> Path:
-    """Ensure base train/val/test JSONL splits exist, preparing them if requested."""
-
-    paths = cfg.get("paths", {}) or {}
-    splits_dir = Path(paths.get("splits_dir", "data/splits"))
-    required = [splits_dir / name for name in ("train.jsonl", "val.jsonl", "test.jsonl")]
-
-    if all(p.exists() for p in required):
-        return splits_dir
-
-    if not prepare_if_missing:
-        missing = ", ".join(p.name for p in required if not p.exists()) or "train.jsonl"
-        raise FileNotFoundError(
-            f"Missing split files ({missing}) under {splits_dir}. "
-            "Run python src/prepare_split.py -c CONFIG to generate them."
-        )
-
-    print(f"[auto_tune_tau] Preparing base splits → {splits_dir}")
-    cmd = ["python", "src/prepare_split.py", "-c", str(config_path)]
-    subprocess.run(cmd, check=True)
-
-    if not all(p.exists() for p in required):
-        raise FileNotFoundError(
-            f"Split preparation completed but required files still missing under {splits_dir}."
-        )
-
-    return splits_dir
-
-
-def _ensure_clusters(
-    cfg: dict,
-    *,
-    prepare_if_missing: bool,
-    config_path: Path,
-) -> Optional[Path]:
-    """Ensure identity cluster TSV exists for episodic sampling constraints."""
-
-    paths = cfg.get("paths", {}) or {}
-    clusters = paths.get("clusters_tsv")
-    if not clusters:
-        return None
-    clusters_path = Path(clusters)
-    if clusters_path.exists():
-        return clusters_path
-
-    if not prepare_if_missing:
-        raise FileNotFoundError(
-            f"clusters_tsv not found: {clusters_path}. "
-            "Run python scripts/cluster_sequences.py -c CONFIG to generate it."
-        )
-
-    # Ensure splits exist before clustering (cluster pipeline depends on them)
-    _ensure_splits(cfg, prepare_if_missing=True, config_path=config_path)
-
-    print(f"[auto_tune_tau] Building identity clusters → {clusters_path}")
-    cmd = ["python", "scripts/cluster_sequences.py", "-c", str(config_path)]
-    subprocess.run(cmd, check=True)
-
-    if not clusters_path.exists():
-        raise FileNotFoundError(
-            f"Cluster generation completed but {clusters_path} is still missing."
-        )
-
-    return clusters_path
-
-
-def _ensure_prototypes(
-    cfg: dict,
-    desired_out: Path,
-    *,
-    train_if_missing: bool = False,
-    config_path: Optional[Path] = None,
-) -> Path:
-    """Return a prototype NPZ path, building it if necessary when feasible.
-
-    Raises FileNotFoundError if it cannot be located or built.
-    """
-    out_path = Path(desired_out)
-    if out_path.exists():
-        return out_path
-
-    # Attempt to build from train split and checkpoint
-    paths = cfg.get("paths", {}) or {}
-    embeddings_path = Path(paths["embeddings"]) if "embeddings" in paths else None
-    outputs_dir = Path(paths.get("outputs", "results"))
-    ckpt_path = outputs_dir / "checkpoints" / "protonet.pt"
-
-    splits_dir: Optional[Path] = None
-    try:
-        splits_dir = _ensure_splits(
-            cfg,
-            prepare_if_missing=bool(train_if_missing),
-            config_path=config_path if config_path is not None else Path("config.yaml"),
-        )
-    except FileNotFoundError as exc:
-        raise FileNotFoundError(
-            f"Unable to locate base splits required for training/prototype building: {exc}"
-        ) from exc
-
-    try:
-        _ensure_clusters(
-            cfg,
-            prepare_if_missing=bool(train_if_missing),
-            config_path=config_path if config_path is not None else Path("config.yaml"),
-        )
-    except FileNotFoundError as exc:
-        raise FileNotFoundError(
-            f"Unable to locate identity clusters required for training: {exc}"
-        ) from exc
-
-    train_split = splits_dir / "train.jsonl" if splits_dir is not None else None
-
-    if not (embeddings_path and train_split):
-        raise FileNotFoundError(
-            "Prototypes not found and cannot auto-build (missing embeddings or train split)."
-        )
-
-    # Ensure checkpoint exists; optionally trigger training when requested
-    if not ckpt_path.exists():
-        if not train_if_missing:
-            raise FileNotFoundError(
-                f"Checkpoint not found: {ckpt_path}. Use --train-if-missing to train before tuning."
-            )
-        # Fire training once to produce the checkpoint
-        cfg_path = Path(config_path) if config_path is not None else None
-        if cfg_path is None:
-            raise FileNotFoundError(
-                f"Checkpoint not found and no config provided to run training: {ckpt_path}"
-            )
-        cmd = ["python", "-m", "src.train_protonet", "-c", str(cfg_path)]
-        print(f"[auto_tune_tau] Training model to create checkpoint → {ckpt_path}")
-        try:
-            subprocess.run(cmd, check=True)
-        except subprocess.CalledProcessError as e:
-            raise FileNotFoundError(
-                f"Training failed; cannot create checkpoint for prototypes. Exit code: {getattr(e, 'returncode', 'NA')}"
-            ) from e
-
-    device = pick_device(cfg)
-    input_dim = infer_input_dim(embeddings_path)
-    model = build_model(cfg, input_dim, device)
-    load_checkpoint(model, ckpt_path, device)
-
-    prototypes, train_counts = build_prototypes(
-        train_split,
-        embeddings_path,
-        model,
-        device=device,
-        subprototypes_per_ec=int(cfg.get("eval", {}).get("subprototypes_per_ec", 1)),
-    )
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    save_prototypes(out_path, prototypes, train_counts=train_counts)
-    return out_path
-
-
-def _write_report(path: Path, records: Sequence[Dict[str, object]]) -> None:
-    if not records:
+    vals = []
+    x = float(start)
+    # Inclusive range with tolerance against float accumulation
+    while x <= stop + 1e-12:
+        vals.append(round(x, 10))
+        x += step
+    return vals
+
+
+def _pick_best_tau(records: List[Dict[str, Any]], constraints: Dict[str, Optional[float]]) -> Dict[str, Any]:
+    """Pick the record with the best micro_f1 subject to optional constraints."""
+    min_p = constraints.get("min_precision")
+    min_r = constraints.get("min_recall")
+    def ok(rec: Dict[str, Any]) -> bool:
+        if min_p is not None and float(rec.get("micro_precision", 0.0)) < float(min_p):
+            return False
+        if min_r is not None and float(rec.get("micro_recall", 0.0)) < float(min_r):
+            return False
+        return True
+    feasible = [r for r in records if ok(r)]
+    pool = feasible if feasible else records
+    return max(pool, key=lambda r: float(r.get("micro_f1", 0.0)))
+
+
+def _maybe_plot_tau_curves(plots_dir: Optional[Path], taus: List[float], series: Dict[str, List[float]]) -> None:
+    if plots_dir is None:
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = sorted({k for record in records for k in record.keys()})
-    with open(path, "w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        for record in records:
-            writer.writerow(record)
-
-
-def _plot_metric_curves(
-    records: Sequence[Dict[str, object]],
-    out_dir: Path,
-    metrics: Sequence[str],
-    *,
-    xlabel: str = "tau",
-    title_prefix: str = "Tuning curve",
-) -> List[Path]:
-    """Render per-metric curves vs tau, grouped by temperature if present.
-
-    Returns a list of saved figure paths. Silently returns [] if matplotlib is unavailable
-    or there are no records.
-    """
-    paths: List[Path] = []
-    if not records:
-        return paths
     try:
         import matplotlib.pyplot as plt  # type: ignore
     except Exception:
-        return paths
+        return
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    # Primary: micro P/R/F1
+    fig, ax = plt.subplots(figsize=(6, 4))
+    if "micro_precision" in series:
+        ax.plot(taus, series["micro_precision"], label="micro_precision")
+    if "micro_recall" in series:
+        ax.plot(taus, series["micro_recall"], label="micro_recall")
+    if "micro_f1" in series:
+        ax.plot(taus, series["micro_f1"], label="micro_f1")
+    ax.set_xlabel("tau")
+    ax.set_ylabel("score")
+    ax.set_title("Calibration: metrics vs tau")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(plots_dir / "metrics_vs_tau.png", dpi=150)
+    plt.close(fig)
 
-    out_dir.mkdir(parents=True, exist_ok=True)
 
-    by_temp: Dict[float, List[Tuple[float, Dict[str, float]]]] = {}
-    for r in records:
-        try:
-            t = float(r.get("temperature", 0.0))
-            tau = float(r.get("tau_multi", 0.0))
-        except Exception:
-            continue
-        by_temp.setdefault(t, []).append((tau, {k: float(r.get(k, float("nan"))) for k in metrics}))
-
-    for metric in metrics:
-        plt.figure(figsize=(7, 4))
-        any_series = False
-        for t, pts in sorted(by_temp.items(), key=lambda kv: kv[0]):
-            pts.sort(key=lambda x: x[0])
-            xs = [p[0] for p in pts]
-            ys = [p[1].get(metric, float("nan")) for p in pts]
-            if not xs:
-                continue
-            any_series = True
-            label = f"T={t:.3f}"
-            plt.plot(xs, ys, marker="o", label=label)
-        if not any_series:
-            plt.close()
-            continue
-        plt.xlabel(xlabel)
-        plt.ylabel(metric)
-        plt.title(f"{title_prefix}: {metric} vs {xlabel}")
-        plt.grid(True, alpha=0.3)
-        if len(by_temp) > 1:
-            plt.legend()
-        fig_path = out_dir / f"tau_curve_{metric}.png"
-        plt.tight_layout()
-        plt.savefig(fig_path, dpi=150)
-        plt.close()
-        paths.append(fig_path)
-    return paths
+def _maybe_plot_temp_curve(plots_dir: Optional[Path], temp_curve: Dict[str, List[float]], method: str) -> None:
+    if plots_dir is None or not temp_curve:
+        return
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+    except Exception:
+        return
+    temps = temp_curve.get("temperatures") or []
+    losses = temp_curve.get("loss") or []
+    if not temps or not losses:
+        return
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.semilogx(temps, losses, marker="o", ms=3)
+    ax.set_xlabel("temperature")
+    ax.set_ylabel(method.upper())
+    ax.set_title(f"Temperature calibration ({method})")
+    ax.grid(True, which="both", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(plots_dir / f"temperature_{method}.png", dpi=150)
+    plt.close(fig)
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Auto-tune tau/temperature for global-support evaluation")
-    ap.add_argument("--config", "-c", type=Path, default=Path("config.yaml"))
-    ap.add_argument("--split", type=str, default="auto", choices=("auto", "train_cal", "train", "val", "test"))
-    ap.add_argument("--protos", type=Path, default=None, help="Optional path to prototypes NPZ (auto if omitted)")
-    ap.add_argument("--tau-min", type=float, default=0.2)
-    ap.add_argument("--tau-max", type=float, default=0.6)
-    ap.add_argument("--tau-step", type=float, default=0.02)
-    ap.add_argument("--temperature-range", nargs=3, type=float, default=None, metavar=("MIN", "MAX", "STEP"))
-    ap.add_argument("--opt-temp", choices=("none", "bce", "brier"), default="none")
-    ap.add_argument("--metric", choices=("micro_f1", "macro_f1", "acc_top1_hit"), default="micro_f1")
-    ap.add_argument("--bucket", choices=("overall", "head", "medium", "tail"), default="overall")
-    ap.add_argument("--min-precision", type=float, default=0.10,
-                    help="Minimum micro-precision constraint (default: 0.10)")
-    ap.add_argument("--min-recall", type=float, default=None)
-    ap.add_argument("--shortlist", type=int, default=None)
-    ap.add_argument("--ensure-top1", choices=("true", "false"), default=None)
-    ap.add_argument("--thresholds", type=Path, default=None, help="Optional per-EC thresholds JSON")
-    ap.add_argument("--per-class-out", type=Path, default=None, help="Optional per-class thresholds JSON output")
-    ap.add_argument("--per-class-mode", choices=("max_f1", "precision_at", "recall_at"), default="max_f1")
-    ap.add_argument("--per-class-target", type=float, default=None,
-                    help="Target precision/recall for precision_at/recall_at modes")
-    ap.add_argument("--per-class-shrink", type=float, default=0.25,
-                    help="Shrink per-EC taus towards global tau (0..1)")
-    ap.add_argument("--per-class-min-positives", type=int, default=5,
-                    help="If a class has <N positives on the calibration split, fall back to global tau")
-    ap.add_argument("--out", type=Path, default=None, help="Calibration JSON output (auto if omitted)")
-    ap.add_argument("--report", type=Path, default=None, help="CSV report output (auto if omitted)")
-    ap.add_argument(
-        "--plots-dir",
-        type=Path,
-        default=None,
-        help="Optional directory to save metric-vs-tau plots (defaults next to report)",
+    parser = argparse.ArgumentParser(
+        description="Run tau calibration (and optional temperature calibration) for global-support eval.",
     )
-    ap.add_argument(
+    parser.add_argument("--config", "-c", type=Path, default=Path("config.yaml"))
+    parser.add_argument("--split", type=str, default=None, help="Calibration split (train/train_cal/val/test)")
+    parser.add_argument("--tau-min", type=float, default=None)
+    parser.add_argument("--tau-max", type=float, default=None)
+    parser.add_argument("--tau-step", type=float, default=None)
+    parser.add_argument("--opt-temp", choices=("none", "bce", "brier"), default="bce")
+    parser.add_argument("--shortlist", type=int, default=None)
+    parser.add_argument("--min-precision", type=float, default=None)
+    parser.add_argument("--min-recall", type=float, default=None)
+    parser.add_argument("--enable-per-class", action="store_true")
+    parser.add_argument("--per-class-mode", choices=("max_f1", "precision_at", "recall_at"), default=None)
+    parser.add_argument("--per-class-target", type=float, default=None)
+    parser.add_argument("--per-class-shrink", type=float, default=None)
+    parser.add_argument("--per-class-min-positives", type=int, default=None)
+    parser.add_argument("--per-class-out", type=Path, default=None, help="Optional JSON path to write per-EC thresholds (ignored unless implemented)")
+    parser.add_argument("--plot-all", action="store_true", help="Force plots for all primary metrics")
+    parser.add_argument(
         "--plot-metric",
         choices=("micro_f1", "macro_f1", "acc_top1_hit"),
-        default="micro_f1",
-        help="Metric to plot in the single tuning curve when not using --plot-all",
+        default=None,
+        help="Single metric to plot when --plot-all is not used",
     )
-    ap.add_argument(
-        "--plot-all",
-        action="store_true",
-        help="If set, generate separate plots for key metrics vs tau",
-    )
-    ap.add_argument(
-        "--train-if-missing",
-        action="store_true",
-        help="If checkpoint/prototypes are missing, train once and build prototypes automatically",
-    )
-    args = ap.parse_args()
+    parser.add_argument("--plots-dir", type=Path, default=None, help="Optional directory for tau plots")
+    # Historical no-op (kept for compatibility with callers)
+    parser.add_argument("--force-embed", action="store_true", help="Ignored; calibration never embeds.")
+    args = parser.parse_args()
 
-    cfg = load_cfg(args.config)
+    # Load full config and resolve effective calibration knobs
+    cfg = load_yaml_cfg(args.config)
+    eval_cfg, cal_cfg = _resolve_calibration_cfg(cfg, args)
+
+    # Paths and evaluator
+    paths = cfg.get("paths", {}) or {}
+    outputs_path = Path(paths.get("outputs", "results")).resolve()
+    split = str(cal_cfg.get("split", eval_cfg.get("split", "train")))
+    shortlist = int(eval_cfg.get("shortlist_topN", 0))
+    base_tau = float(eval_cfg.get("tau_multi", 0.35))
+    base_temp = float(eval_cfg.get("temperature", 0.07))
+    proto_path = Path(eval_cfg.get("prototypes_path") or (outputs_path / "prototypes.npz"))
+    per_ec_path = None  # reserved for future per-EC threshold tuning
+    plots_dir = Path(cal_cfg.get("plots_dir")) if cal_cfg.get("plots_dir") else None
+
     device = pick_device(cfg)
-    eval_cfg = cfg.get("eval", {}) or {}
-
-    shortlist = int(args.shortlist if args.shortlist is not None else eval_cfg.get("shortlist_topN", 0))
-    ensure_top1_cfg = bool(eval_cfg.get("ensure_top1", True))
-    ensure_top1_flag = _parse_bool_flag(args.ensure_top1)
-    ensure_top1 = ensure_top1_cfg if ensure_top1_flag is None else ensure_top1_flag
-
-    # Resolve prototype path (prefer CLI, else config, else build)
-    protos_path: Optional[Path] = args.protos
-    if protos_path is None:
-        p = eval_cfg.get("prototypes_path")
-        protos_path = Path(p) if p else Path("artifacts/prototypes.npz")
-    try:
-        protos_path = _ensure_prototypes(
-            cfg,
-            protos_path,
-            train_if_missing=bool(args.train_if_missing),
-            config_path=Path(args.config),
-        )
-    except FileNotFoundError:
-        if not Path(protos_path).exists():
-            raise
-
-    # Resolve out/report paths
-    out_path = args.out
-    if out_path is None:
-        cp = eval_cfg.get("calibration_path")
-        out_path = Path(cp) if cp else Path("artifacts/calibration.json")
-        # If config points to a folder that doesn't exist yet, place next to prototypes
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path = args.report
-    if report_path is None:
-        report_path = out_path.with_name("tune_report.csv")
-
-    # Pick split
-    split = args.split
-    if split == "auto":
-        candidates = ("train_cal", "train", "val", "test")
-        chosen = _choose_split_with_coverage(cfg, protos_path, candidates)
-        split = chosen or "train"
-
-    thresholds = _load_thresholds(args.thresholds)
-
     evaluator = GlobalSupportEvaluator(
         cfg,
-        protos_path,
+        proto_path,
         split,
         device=device,
         shortlist_topN=shortlist,
-        per_ec_thresholds=thresholds,
-        ensure_top1=ensure_top1,
+        per_ec_thresholds=None,
+        ensure_top1=bool(eval_cfg.get("ensure_top1", True)),
+        show_progress=bool(cfg.get("progress", True)),
     )
 
-    # Build search grids
-    tau_values = _frange(args.tau_min, args.tau_max, args.tau_step)
-    tau_values = sorted({float(t) for t in tau_values})
-
-    base_temperature = float(eval_cfg.get("temperature", 0.07))
-    if args.temperature_range is None:
-        temps: List[float] = [base_temperature]
-    else:
-        t_min, t_max, t_step = args.temperature_range
-        temps = _frange(t_min, t_max, t_step)
-
-    temperature_history: List[Dict[str, float]] = []
-    if args.opt_temp != "none" and args.temperature_range is None:
-        best_temp, temperature_history = _optimize_temperature(
-            evaluator,
-            args.opt_temp,
-            default_temperature=base_temperature,
+    # 1) Optional temperature calibration
+    opt_temp = str(cal_cfg.get("opt_temp", "none")).lower()
+    best_temp = float(base_temp)
+    temp_curve: Dict[str, List[float]] = {}
+    if opt_temp in {"bce", "brier"}:
+        best_temp, temp_curve = _optimize_temperature(
+            evaluator.class_logits, evaluator.y_true, opt_temp, base_temp
         )
-        temps = [best_temp]
+        _maybe_plot_temp_curve(plots_dir, temp_curve, opt_temp)
 
-    primary_key, tie1_key, tie2_key, precision_key, recall_key = _resolve_metric_keys(args.metric, args.bucket)
+    # 2) Tau grid search against the chosen temperature
+    tau_min, tau_max, tau_step = cal_cfg.get("tau_range", [0.2, 0.6, 0.02])
+    try:
+        tau_min = float(tau_min); tau_max = float(tau_max); tau_step = float(tau_step)
+    except Exception:
+        tau_min, tau_max, tau_step = 0.2, 0.6, 0.02
+    taus = _frange(tau_min, tau_max, tau_step)
 
-    report_records: List[Dict[str, object]] = []
-    best_metrics: Optional[Dict[str, float]] = None
-    best_record: Optional[Dict[str, object]] = None
+    records: List[Dict[str, Any]] = []
+    series: Dict[str, List[float]] = {"micro_precision": [], "micro_recall": [], "micro_f1": []}
+    for t in taus:
+        m = evaluator.evaluate(temperature=best_temp, tau_multi=t, shortlist_topN=shortlist)
+        m["tau_multi"] = float(t)
+        records.append(m)
+        series["micro_precision"].append(float(m.get("micro_precision", 0.0)))
+        series["micro_recall"].append(float(m.get("micro_recall", 0.0)))
+        series["micro_f1"].append(float(m.get("micro_f1", 0.0)))
 
-    for temp in temps:
-        for tau in tau_values:
-            metrics = evaluator.evaluate(
-                temperature=temp,
-                tau_multi=tau,
-                shortlist_topN=shortlist,
-            )
+    best = _pick_best_tau(records, cal_cfg.get("constraints") or {})
+    best_tau = float(best.get("tau_multi", base_tau))
+    _maybe_plot_tau_curves(plots_dir, taus, series)
 
-            if primary_key not in metrics:
-                raise KeyError(f"Metric key '{primary_key}' not found in evaluator output")
-
-            meets_constraints = True
-            if args.min_precision is not None:
-                precision_val = metrics.get(precision_key)
-                if precision_val is None:
-                    raise KeyError(f"Precision key '{precision_key}' not found in evaluator output")
-                if precision_val < args.min_precision - 1e-12:
-                    meets_constraints = False
-            if meets_constraints and args.min_recall is not None:
-                recall_val = metrics.get(recall_key)
-                if recall_val is None:
-                    raise KeyError(f"Recall key '{recall_key}' not found in evaluator output")
-                if recall_val < args.min_recall - 1e-12:
-                    meets_constraints = False
-
-            record = dict(metrics)
-            record["meets_constraints"] = bool(meets_constraints)
-            record["objective_score"] = float(metrics[primary_key])
-            report_records.append(record)
-
-            if not meets_constraints:
-                continue
-
-            candidate = (
-                float(metrics[primary_key]),
-                float(metrics.get(tie1_key, -float("inf"))),
-                float(metrics.get(tie2_key, -float("inf"))),
-            )
-
-            if best_metrics is None:
-                best_metrics = metrics
-                best_record = record
-                continue
-
-            current = (
-                float(best_metrics[primary_key]),
-                float(best_metrics.get(tie1_key, -float("inf"))),
-                float(best_metrics.get(tie2_key, -float("inf"))),
-            )
-
-            if candidate > current:
-                best_metrics = metrics
-                best_record = record
-
-    if best_metrics is None or best_record is None:
-        # Fallback: pick the best unconstrained candidate (warn the user)
-        if not report_records:
-            raise RuntimeError("No candidate satisfied the objective and constraints, and no records to fallback to")
-        def _score(rec: Dict[str, object]) -> Tuple[float, float, float]:
-            return (
-                float(rec.get(primary_key, -float("inf"))),
-                float(rec.get(tie1_key, -float("inf"))),
-                float(rec.get(tie2_key, -float("inf"))),
-            )
-        best_record = max(report_records, key=_score)
-        # Reuse the record as metrics-like mapping
-        best_metrics = {k: float(v) if isinstance(v, (int, float)) else v for k, v in best_record.items() if isinstance(k, str)}  # type: ignore[assignment]
-        print("[warn] No candidate met constraints; falling back to best unconstrained result.")
-
-    best_out = {
-        "tau_multi": float(best_metrics["tau_multi"]),
-        "temperature": float(best_metrics["temperature"]),
-        "micro_f1": float(best_metrics.get("micro_f1", 0.0)),
-        "macro_f1": float(best_metrics.get("macro_f1", 0.0)),
-        "acc_top1_hit": float(best_metrics.get("acc_top1_hit", 0.0)),
-        "metric": args.metric,
-        "bucket": args.bucket,
-        "objective_score": float(best_metrics[primary_key]),
-        "constraints_satisfied": bool(best_record.get("meets_constraints", False) if isinstance(best_record, dict) else False),
-        "split": str(split),
+    # 3) Write calibration.json into the current outputs directory
+    calib_path = Path(eval_cfg.get("calibration_path") or (outputs_path / "calibration.json"))
+    calib_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "tau_multi": float(best_tau),
+        "temperature": float(best_temp),
         "shortlist_topN": int(shortlist),
+        "opt_temp": opt_temp,
+        "grid": {
+            "taus": [float(x) for x in taus],
+            "micro_precision": series["micro_precision"],
+            "micro_recall": series["micro_recall"],
+            "micro_f1": series["micro_f1"],
+        },
     }
-    if temperature_history:
-        best_out["temperature_search"] = temperature_history
+    if temp_curve:
+        payload["temperature_curve"] = temp_curve
+    with open(calib_path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
 
-    # Write outputs
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as handle:
-        json.dump(best_out, handle, indent=2)
-    _write_report(report_path, report_records)
-
-    # Print compact summary and a small table
-    print(json.dumps(best_out, indent=2))
-    # Show top lines (sort by objective)
-    try:
-        rows = [r for r in report_records if r.get("meets_constraints", False)]
-        rows.sort(key=lambda r: (
-            float(r.get(primary_key, 0.0)),
-            float(r.get(tie1_key, 0.0)),
-            float(r.get(tie2_key, 0.0)),
-        ), reverse=True)
-        head = rows[:10]
-        if head:
-            print("\nTop candidates (tau, temp, micro_f1, macro_f1, acc_top1):")
-            for r in head:
-                print(
-                    f"  tau={r.get('tau_multi'):0.3f}  T={r.get('temperature'):0.3f}  "
-                    f"micro_f1={r.get('micro_f1', 0.0):0.4f}  macro_f1={r.get('macro_f1', 0.0):0.4f}  "
-                    f"acc_top1={r.get('acc_top1_hit', 0.0):0.4f}"
-                )
-        else:
-            print("\nNo candidates met constraints; see CSV report for details.")
-    except Exception:
-        # Don't fail tuning just because of printing
-        pass
-
-    # Optional plots: per-metric curves vs tau
-    try:
-        if report_records:
-            plots_dir = args.plots_dir if args.plots_dir is not None else report_path.parent
-            if args.plot_all:
-                metric_list = [
-                    "micro_f1",
-                    "macro_f1",
-                    "acc_top1_hit",
-                    "micro_precision",
-                    "micro_recall",
-                ]
-                saved = _plot_metric_curves(
-                    report_records,
-                    plots_dir,
-                    metric_list,
-                    xlabel="tau",
-                    title_prefix="Tuning curve",
-                )
-                for p in saved:
-                    print(f"Saved plot → {p}")
-            else:
-                # Single plot for --plot-metric
-                # Reuse helper by asking it to render just one metric and then rename to legacy name
-                saved = _plot_metric_curves(
-                    report_records,
-                    plots_dir,
-                    [args.plot_metric],
-                    xlabel="tau",
-                    title_prefix="Tuning curve",
-                )
-                if saved:
-                    # Backward-compatible filename
-                    legacy = report_path.with_name("tune_curve.png")
-                    try:
-                        # Copy the plotted figure to legacy path if different dir
-                        if saved[0] != legacy:
-                            import shutil
-                            shutil.copyfile(saved[0], legacy)
-                        print(f"\nSaved tuning curve → {legacy}")
-                    except Exception:
-                        print(f"\nSaved tuning curve → {saved[0]}")
-        else:
-            print("\nNo report records to plot.")
-    except Exception:
-        # Matplotlib may be unavailable; silently skip.
-        pass
-
-    # Optional: per-class thresholds
-    try:
-        if args.per_class_out is not None:
-            target = args.per_class_target
-            if args.per_class_mode in {"precision_at", "recall_at"} and target is None:
-                raise ValueError("--per-class-target is required for precision_at and recall_at modes")
-            if target is not None and not (0.0 <= float(target) <= 1.0):
-                raise ValueError("--per-class-target must lie in [0, 1]")
-
-            per_class_thresholds = _compute_per_class_thresholds(
-                evaluator,
-                temperature=float(best_metrics["temperature"]),
-                tau_grid=sorted({*tau_values, float(best_metrics["tau_multi"])}),
-                shortlist=shortlist,
-                ensure_top1=ensure_top1,
-                global_tau=float(best_metrics["tau_multi"]),
-                shrink=float(args.per_class_shrink),
-                min_positives=int(args.per_class_min_positives),
-                mode=args.per_class_mode,
-                target=target,
-            )
-            args.per_class_out.parent.mkdir(parents=True, exist_ok=True)
-            with open(args.per_class_out, "w", encoding="utf-8") as handle:
-                json.dump(per_class_thresholds, handle, indent=2)
-            print(f"Saved per-EC thresholds → {args.per_class_out}")
-    except Exception as e:
-        print(f"[warn] per-class thresholding skipped: {e}")
+    print(f"[auto_tune_tau] Wrote calibration → {calib_path}")
+    if plots_dir is not None:
+        print(f"[auto_tune_tau] Plots → {plots_dir}")
 
 
 if __name__ == "__main__":

@@ -134,6 +134,34 @@ def aggregate_counts(long_df: pd.DataFrame, out_dir: Path) -> dict:
     return stats
 
 
+def _natural_sort_labels(labels: pd.Index) -> list:
+    """Return labels sorted numerically when possible, with 'NA' pushed to the end."""
+    values = list(labels)
+    if not values:
+        return values
+    series = pd.Series(values, dtype="object")
+    numeric = pd.to_numeric(series, errors="coerce")
+
+    def sort_key(idx: int):
+        value = series.iloc[idx]
+        num = numeric.iloc[idx]
+        if pd.notna(num):
+            return (0, float(num), str(value))
+        if isinstance(value, str) and value.upper() == "NA":
+            return (2, str(value))
+        return (1, str(value))
+
+    order = sorted(range(len(values)), key=sort_key)
+    return [values[i] for i in order]
+
+
+def _sort_pivot_naturally(pivot: pd.DataFrame) -> pd.DataFrame:
+    """Reindex pivot rows and columns using natural numeric ordering."""
+    sorted_index = _natural_sort_labels(pivot.index)
+    sorted_columns = _natural_sort_labels(pivot.columns)
+    return pivot.reindex(sorted_index).reindex(columns=sorted_columns)
+
+
 def save_heatmap_png(plt, pivot: pd.DataFrame, title: str, out_path: Path) -> None:
     fig, ax = plt.subplots(figsize=(max(6, 0.4 * len(pivot.columns)), max(4, 0.4 * len(pivot.index))))
     im = ax.imshow(pivot.values, aspect="auto", cmap="viridis")
@@ -190,18 +218,16 @@ def make_matplotlib_plots(long_df: pd.DataFrame, out_dir: Path, top_k: int) -> l
     piv12 = (
         long_df.assign(ec12=long_df["ec1"] + "." + long_df["ec2"])  # not used directly; for clarity
         .pivot_table(index="ec1", columns="ec2", values="accession", aggfunc="count", fill_value=0)
-        .sort_index(axis=0)
-        .sort_index(axis=1)
     )
+    piv12 = _sort_pivot_naturally(piv12)
     # Heatmaps with generic ECx-style titles
     save_heatmap_png(plt, piv12, "ECx vs ECx.x (counts)", out_dir / "heatmap_ec1_ec2.png")
     notes.append("Saved heatmap_ec1_ec2.png")
 
     piv23 = (
         long_df.pivot_table(index="ec2", columns="ec3", values="accession", aggfunc="count", fill_value=0)
-        .sort_index(axis=0)
-        .sort_index(axis=1)
     )
+    piv23 = _sort_pivot_naturally(piv23)
     save_heatmap_png(plt, piv23, "ECx.x vs ECx.x.x (counts)", out_dir / "heatmap_ec2_ec3.png")
     notes.append("Saved heatmap_ec2_ec3.png")
 

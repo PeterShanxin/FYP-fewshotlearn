@@ -6,6 +6,7 @@ Outputs summary stats, CSV aggregates, and plots (when libraries available):
 - top-K EC full bar chart (PNG; requires matplotlib)
 - EC1 distribution bar chart (PNG; requires matplotlib)
 - EC1xEC2 and EC2xEC3 heatmaps (PNG; requires matplotlib)
+- Single-EC vs Multi-EC pie chart (PNG; requires matplotlib)
 - hierarchical sunburst and 4-stage Sankey (HTML; requires plotly)
 
 Usage:
@@ -61,6 +62,13 @@ def normalize_long_df(df: pd.DataFrame) -> pd.DataFrame:
         df[c] = df[c].replace({"-": "NA", "": "NA", "nan": "NA"})
     df["ec_full"] = df["ec_full"].replace({"": pd.NA}).fillna("NA")
     return df
+
+
+def partial_ec_mask(ec_full: pd.Series) -> pd.Series:
+    """Return boolean mask where EC annotation is incomplete (contains '-' or NA markers)."""
+    series = ec_full.astype(str).str.strip()
+    upper = series.str.upper()
+    return series.str.contains("-", regex=False) | upper.isin({"NA", "N/A"})
 
 
 def load_data(data_root: Path) -> tuple[pd.DataFrame, pd.DataFrame | None]:
@@ -125,11 +133,18 @@ def aggregate_counts(long_df: pd.DataFrame, out_dir: Path) -> dict:
     ecfull = long_df["ec_full"].value_counts()
     dffull = _save_counts("ec_full", ecfull)
 
+    mask_partial = partial_ec_mask(long_df["ec_full"])
+    n_partial = int(mask_partial.sum())
+    n_complete = int(len(long_df) - n_partial)
+
     stats.update(
         n_ec1=int(len(df1)),
         n_ec12=int(len(df12)),
         n_ec123=int(len(df123)),
         n_ec_full=int(len(dffull)),
+        partial_ec_rows=n_partial,
+        complete_ec_rows=n_complete,
+        partial_ec_ratio=float(n_partial / len(long_df)) if len(long_df) else 0.0,
     )
     return stats
 
@@ -189,6 +204,36 @@ def save_bar_png(plt, series: pd.Series, title: str, out_path: Path, top_k: int 
     plt.close(fig)
 
 
+def save_pie_png(plt, sizes: list[int], labels: list[str], title: str, out_path: Path) -> None:
+    fig, ax = plt.subplots(figsize=(6, 6))
+    colors = ["#66c2a5", "#fc8d62"]
+    wedges, texts, autotexts = ax.pie(
+        sizes,
+        autopct="%1.1f%%",
+        startangle=90,
+        colors=colors,
+        pctdistance=0.7,
+        textprops={"color": "white", "weight": "bold"},
+        wedgeprops={"linewidth": 1, "edgecolor": "white"},
+    )
+    # Matplotlib returns placeholder text objects even without explicit labels; hide them.
+    for txt in texts:
+        txt.set_visible(False)
+    ax.legend(
+        wedges,
+        labels,
+        title="Class",
+        loc="center left",
+        bbox_to_anchor=(1, 0.5),
+        frameon=False,
+    )
+    ax.axis("equal")  # Keep pie circular
+    ax.set_title(title)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def make_matplotlib_plots(long_df: pd.DataFrame, out_dir: Path, top_k: int) -> list[str]:
     plt = _try_import_matplotlib()
     if plt is None:
@@ -213,6 +258,33 @@ def make_matplotlib_plots(long_df: pd.DataFrame, out_dir: Path, top_k: int) -> l
         top_k=top_k,
     )
     notes.append("Saved top_ec_full.png")
+
+    # Pie: Single-EC vs Multi-EC per accession
+    acc_counts = long_df.groupby("accession").size()
+    n_single = int((acc_counts == 1).sum())
+    n_multi = int((acc_counts > 1).sum())
+    if (n_single + n_multi) > 0:
+        save_pie_png(
+            plt,
+            sizes=[n_single, n_multi],
+            labels=[f"Single-EC ({n_single})", f"Multi-EC ({n_multi})"],
+            title="Single-EC vs Multi-EC (per accession)",
+            out_path=out_dir / "pie_single_vs_multi.png",
+        )
+        notes.append("Saved pie_single_vs_multi.png")
+
+    mask_partial = partial_ec_mask(long_df["ec_full"])
+    n_partial = int(mask_partial.sum())
+    n_complete = int(len(long_df) - n_partial)
+    if (n_partial + n_complete) > 0:
+        save_pie_png(
+            plt,
+            sizes=[n_partial, n_complete],
+            labels=[f"Partial EC ({n_partial})", f"Complete EC ({n_complete})"],
+            title="Partial vs Complete EC annotations",
+            out_path=out_dir / "pie_partial_vs_full.png",
+        )
+        notes.append("Saved pie_partial_vs_full.png")
 
     # Heatmaps
     piv12 = (
@@ -332,6 +404,10 @@ def main():
         readme.append("- ec1_distribution.png")
     if any("top_ec_full.png" in n for n in notes):
         readme.append("- top_ec_full.png")
+    if any("pie_single_vs_multi.png" in n for n in notes):
+        readme.append("- pie_single_vs_multi.png")
+    if any("pie_partial_vs_full.png" in n for n in notes):
+        readme.append("- pie_partial_vs_full.png")
     if any("heatmap_ec1_ec2.png" in n for n in notes):
         readme.append("- heatmap_ec1_ec2.png, heatmap_ec2_ec3.png")
     if any("sunburst_ec_hierarchy.html" in n for n in notes):

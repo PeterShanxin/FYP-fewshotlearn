@@ -41,6 +41,17 @@ RUNALL_SCOPE_TAG="${RUNALL_SCOPE_TAG:-}"
 declare -A PHASE_STARTS=()
 CURRENT_PHASE=""
 
+TRACEBACK_TAIL_LINES=${TRACEBACK_TAIL_LINES:-120}
+if ! TRACEBACK_CAPTURE="$(mktemp -t run_all_traceback.XXXXXX)"; then
+  echo "[run_all][warn] failed to create temporary traceback capture file" >&2
+  TRACEBACK_CAPTURE=""
+fi
+# Mirror stderr to a capture file so failures can be summarized in logs
+exec 3>&2
+if [ -n "$TRACEBACK_CAPTURE" ]; then
+  exec 2> >(tee -a "$TRACEBACK_CAPTURE" >&3)
+fi
+
 # Emit timestamp in Singapore Time (SGT)
 # Include timezone abbreviation to avoid "+0800" confusion.
 timestamp() {
@@ -88,6 +99,11 @@ phase_complete() {
 # Always print total runtime on exit (success or failure)
 on_exit() {
   local status=$?
+  # Restore original stderr so the tee process flushes before we inspect logs.
+  if [ -n "${TRACEBACK_CAPTURE:-}" ]; then
+    exec 2>&3
+    exec 3>&-
+  fi
   # If a terminating signal occurred, normalize the exit code to 128+signum
   # and record it so logs/readers see a non-zero failure instead of 0.
   if [ -n "$TERM_SIGNAL" ]; then
@@ -99,11 +115,32 @@ on_exit() {
       *)       status=1   ;;
     esac
   fi
-  local end_time=$(date +%s)
+  local end_time
+  end_time=$(date +%s)
   local elapsed=$((end_time - start_time))
+  if [ "$elapsed" -lt 0 ]; then
+    elapsed=0
+  fi
   local hours=$((elapsed / 3600))
   local mins=$(((elapsed % 3600) / 60))
   local secs=$((elapsed % 60))
+  local elapsed_hms
+  elapsed_hms=$(printf "%02d:%02d:%02d" "$hours" "$mins" "$secs")
+
+  local trace_path=""
+  if [ -n "${TRACEBACK_CAPTURE:-}" ] && [ -s "${TRACEBACK_CAPTURE}" ]; then
+    trace_path="${TRACEBACK_CAPTURE}"
+  fi
+  if [ "$status" -ne 0 ] && [ -n "$trace_path" ] && [ -n "${LOG_DIR:-}" ]; then
+    local target_path="${LOG_DIR}/run_all_traceback.log"
+    if [ "$trace_path" != "$target_path" ]; then
+      if mv "$trace_path" "$target_path" 2>/dev/null; then
+        trace_path="$target_path"
+      elif cp "$trace_path" "$target_path" 2>/dev/null; then
+        trace_path="$target_path"
+      fi
+    fi
+  fi
 
   if [ -n "${STATUS_LOG:-}" ]; then
     # Log any unfinished current phase as failed when exiting non-zero
@@ -120,12 +157,56 @@ on_exit() {
     fi
     # Always emit a pipeline completion line with accurate status/exit_code
     if [ -n "$TERM_SIGNAL" ]; then
-      log_line "pipeline event=completed status=failure reason=terminated signal=${TERM_SIGNAL} exit_code=${status} total_seconds=${elapsed}"
+      log_line "pipeline event=completed status=failure reason=terminated signal=${TERM_SIGNAL} exit_code=${status} total_seconds=${elapsed} total_hms=${elapsed_hms}"
     elif [ "$status" -eq 0 ]; then
-      log_line "pipeline event=completed status=success total_seconds=${elapsed}"
+      log_line "pipeline event=completed status=success total_seconds=${elapsed} total_hms=${elapsed_hms}"
     else
-      log_line "pipeline event=completed status=failure exit_code=${status} total_seconds=${elapsed}"
+      log_line "pipeline event=completed status=failure exit_code=${status} total_seconds=${elapsed} total_hms=${elapsed_hms}"
     fi
+  fi
+
+  if [ "$status" -ne 0 ] && [ -n "$trace_path" ] && [ -n "${STATUS_LOG:-}" ]; then
+    local tail_lines=${TRACEBACK_TAIL_LINES:-120}
+    local excerpt
+    excerpt=$(tail -n "$tail_lines" "$trace_path" 2>/dev/null || true)
+    if [ -n "$excerpt" ]; then
+      local sanitized
+      sanitized=$(
+        printf '%s\n' "$excerpt" | python - <<'PY'
+import re, sys
+lines = sys.stdin.read().splitlines()
+ansi = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
+cleaned = []
+prev = None
+for raw in lines:
+    text = raw.replace('\r', '')
+    text = ansi.sub('', text).strip()
+    if not text:
+        continue
+    if text == prev:
+        continue
+    prev = text
+    cleaned.append(text)
+sys.stdout.write("\n".join(cleaned))
+PY
+      )
+      if [ -n "$sanitized" ]; then
+        local lines_count
+        lines_count=$(printf '%s\n' "$sanitized" | wc -l | tr -d ' ')
+        log_line "pipeline event=traceback_excerpt exit_code=${status} lines=${lines_count} source=${trace_path}"
+        while IFS= read -r line; do
+          [ -z "$line" ] && continue
+          local escaped=${line//\\/\\\\}
+          escaped=${escaped//\"/\\\"}
+          escaped=${escaped//$'\t'/\\t}
+          log_line "traceback exit_code=${status} line=\"${escaped}\""
+        done <<< "$sanitized"
+      fi
+    fi
+  fi
+
+  if [ "$status" -eq 0 ] && [ -n "$trace_path" ]; then
+    rm -f "$trace_path"
   fi
 
   # Console summary: treat status==0 as success regardless of 'completed'
@@ -138,7 +219,7 @@ on_exit() {
       printf "[run_all] Failed with exit code %d.\n" "$status" >&2
     fi
   fi
-  printf "[run_all] Total runtime: %02dh:%02dm:%02ds\n" "$hours" "$mins" "$secs"
+  printf "[run_all] Total runtime: %02dh:%02dm:%02ds (%s)\n" "$hours" "$mins" "$secs" "$elapsed_hms"
   exit "$status"
 }
 trap on_exit EXIT

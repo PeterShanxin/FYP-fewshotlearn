@@ -13,7 +13,13 @@ import argparse
 import json
 import os
 import shutil
+import signal
 import subprocess
+import sys
+import threading
+import time
+import traceback
+from collections import deque
 from copy import deepcopy
 from pathlib import Path
 from typing import Dict, List, Tuple, Any, Optional
@@ -54,8 +60,96 @@ def _status_log(message: str) -> None:
         pass
 
 
+def _run_with_live_output(
+    cmd: List[str],
+    *,
+    env: Optional[Dict[str, str]] = None,
+    tail_lines: int = 80,
+) -> tuple[int, list[str]]:
+    """Execute a subprocess while streaming output and keeping a stderr tail."""
+
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        env=env,
+    )
+    stderr_tail: deque[str] = deque(maxlen=tail_lines if tail_lines and tail_lines > 0 else 0)
+
+    def _forward(src, dst, keep_tail: Optional[deque[str]] = None) -> None:
+        try:
+            for line in iter(src.readline, ""):
+                dst.write(line)
+                dst.flush()
+                if keep_tail is not None:
+                    keep_tail.append(line.rstrip("\n"))
+        finally:
+            src.close()
+
+    threads = [
+        threading.Thread(target=_forward, args=(process.stdout, sys.stdout, None)),
+        threading.Thread(target=_forward, args=(process.stderr, sys.stderr, stderr_tail)),
+    ]
+    for t in threads:
+        t.daemon = True
+        t.start()
+    return_code = process.wait()
+    for t in threads:
+        t.join()
+    return return_code, list(stderr_tail)
+
+
 def run(cmd: List[str]) -> None:
     subprocess.run(cmd, check=True)
+
+
+_CALIBRATION_CONTEXT = {"cutoff": None, "fold": None, "start": None}
+_ABORT_STATE = {"pipeline_logged": False}
+
+
+def _handle_termination(sig: int, _frame: Optional[Any]) -> None:
+    """Log a structured failure when the benchmark receives a termination signal."""
+
+    try:
+        sig_name = signal.Signals(sig).name  # type: ignore[attr-defined]
+    except Exception:
+        sig_name = str(sig)
+    exit_code = 128 + (sig if sig is not None else 0)
+    if exit_code < 0:
+        exit_code = 1
+
+    if not _ABORT_STATE.get("pipeline_logged", False):
+        cutoff = _CALIBRATION_CONTEXT.get("cutoff")
+        fold = _CALIBRATION_CONTEXT.get("fold")
+        start = _CALIBRATION_CONTEXT.get("start")
+        if cutoff is not None and fold is not None:
+            elapsed = 0
+            if start is not None:
+                try:
+                    elapsed = max(0, int(time.monotonic() - float(start)))
+                except Exception:
+                    elapsed = 0
+            _status_log(
+                f"phase=calibrate cutoff={cutoff} fold={fold} event=finish status=failed reason=signal signal={sig_name} exit_code={exit_code} duration_seconds={elapsed}"
+            )
+        _status_log(f"pipeline event=signal status=failure signal={sig_name} exit_code={exit_code}")
+        _ABORT_STATE["pipeline_logged"] = True
+
+    raise SystemExit(exit_code)
+
+
+def _install_signal_handlers() -> None:
+    """Capture termination signals so we can emit structured log entries."""
+
+    for sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGINT", None), getattr(signal, "SIGHUP", None)):
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _handle_termination)  # type: ignore[arg-type]
+        except (ValueError, OSError, RuntimeError, AttributeError):
+            continue
 
 
 def load_cfg(path: str) -> dict:
@@ -168,20 +262,35 @@ def _run_calibration(
     print(
         f"[benchmark][calibrate] cutoff={cutoff_pct} fold={fold_index} split={split} opt_temp={opt_temp}"
     )
+    # Propagate a scope tag so nested run_all.sh can tee status lines back
+    # to the parent's log and annotate entries with cutoff/fold for clarity.
+    env = os.environ.copy()
+    env["RUNALL_SCOPE_TAG"] = f"scope=calibrate cutoff={cutoff_pct} fold={fold_index}"
+    start_ts = time.monotonic()
+    _CALIBRATION_CONTEXT["cutoff"] = cutoff_pct
+    _CALIBRATION_CONTEXT["fold"] = fold_index
+    _CALIBRATION_CONTEXT["start"] = start_ts
     try:
-        # Propagate a scope tag so nested run_all.sh can tee status lines back
-        # to the parent's log and annotate entries with cutoff/fold for clarity.
-        env = os.environ.copy()
-        env["RUNALL_SCOPE_TAG"] = f"scope=calibrate cutoff={cutoff_pct} fold={fold_index}"
-        subprocess.run(cmd, check=True, env=env)
-    except subprocess.CalledProcessError as exc:
+        return_code, stderr_tail = _run_with_live_output(cmd, env=env)
+        elapsed = max(0, int(time.monotonic() - start_ts))
+        if return_code != 0:
+            _status_log(
+                f"phase=calibrate cutoff={cutoff_pct} fold={fold_index} event=finish status=failed exit_code={return_code} duration_seconds={elapsed}"
+            )
+            for line in stderr_tail:
+                if not line:
+                    continue
+                _status_log(
+                    f"traceback phase=calibrate cutoff={cutoff_pct} fold={fold_index} line={json.dumps(line)}"
+                )
+            raise subprocess.CalledProcessError(return_code, cmd)
         _status_log(
-            f"phase=calibrate cutoff={cutoff_pct} fold={fold_index} event=finish status=failed exit_code={getattr(exc, 'returncode', 'NA')}"
+            f"phase=calibrate cutoff={cutoff_pct} fold={fold_index} event=finish status=success duration_seconds={elapsed}"
         )
-        raise
-    _status_log(
-        f"phase=calibrate cutoff={cutoff_pct} fold={fold_index} event=finish status=success"
-    )
+    finally:
+        _CALIBRATION_CONTEXT["cutoff"] = None
+        _CALIBRATION_CONTEXT["fold"] = None
+        _CALIBRATION_CONTEXT["start"] = None
 
     if calibrate_only:
         dest_dir = results_root / "figures"
@@ -201,6 +310,8 @@ def main() -> None:
     ap.add_argument("--force-embed", dest="force_embed", action="store_true", help="Recompute embeddings even if files exist")
     ap.add_argument("--calibrate-only", action="store_true", help="Run calibration-only workflow and skip downstream evaluation")
     args = ap.parse_args()
+
+    _install_signal_handlers()
 
     base_cfg = load_cfg(args.config)
     bench_cfg = base_cfg.get("identity_benchmark", {}) or {}
@@ -378,12 +489,18 @@ def main() -> None:
 
             if need_embed:
                 _status_log(f"phase=embed cutoff={pct} fold={fi+1} event=start")
+                embed_start = time.monotonic()
                 try:
                     run(["python", "-m", "src.embed_sequences", "-c", str(cfg_path)])
-                    _status_log(f"phase=embed cutoff={pct} fold={fi+1} event=finish status=success")
+                    elapsed = int(time.monotonic() - embed_start)
+                    _status_log(f"phase=embed cutoff={pct} fold={fi+1} event=finish status=success duration_seconds={elapsed}")
                     if args.force_embed:
                         force_embed_paths_done.add(base)
-                except subprocess.CalledProcessError:
+                except subprocess.CalledProcessError as exc:
+                    elapsed = int(time.monotonic() - embed_start)
+                    _status_log(
+                        f"phase=embed cutoff={pct} fold={fi+1} event=finish status=failed exit_code={getattr(exc, 'returncode', 'NA')} duration_seconds={elapsed}"
+                    )
                     # Fallback: generate synthetic embeddings for union of split accessions
                     print("[benchmark] Embedding step failed; generating synthetic embeddings for smoke")
                     import json as _json
@@ -407,8 +524,9 @@ def main() -> None:
                     _np.save(Xp, X)
                     _np.save(Kp, _np.array(keys, dtype="U"))
                     print(f"[benchmark] Wrote synthetic embeddings: N={len(keys)} D={D} → {Xp}, {Kp}")
+                    fallback_elapsed = int(time.monotonic() - embed_start)
                     _status_log(
-                        f"phase=embed cutoff={pct} fold={fi+1} event=finish status=fallback_synthetic N={len(keys)} D={D}"
+                        f"phase=embed cutoff={pct} fold={fi+1} event=finish status=fallback_synthetic N={len(keys)} D={D} duration_seconds={fallback_elapsed}"
                     )
                     if args.force_embed:
                         force_embed_paths_done.add(base)
@@ -418,16 +536,20 @@ def main() -> None:
                     f"phase=embed cutoff={pct} fold={fi+1} event=skip reason={reason}"
                 )
             _status_log(f"phase=train cutoff={pct} fold={fi+1} event=start")
+            train_start = time.monotonic()
             try:
                 run(["python", "-m", "src.train_protonet", "-c", str(cfg_path)])
-                _status_log(f"phase=train cutoff={pct} fold={fi+1} event=finish status=success")
+                elapsed = int(time.monotonic() - train_start)
+                _status_log(f"phase=train cutoff={pct} fold={fi+1} event=finish status=success duration_seconds={elapsed}")
             except subprocess.CalledProcessError as e:
+                elapsed = int(time.monotonic() - train_start)
                 _status_log(
-                    f"phase=train cutoff={pct} fold={fi+1} event=finish status=failed exit_code={getattr(e, 'returncode', 'NA')}"
+                    f"phase=train cutoff={pct} fold={fi+1} event=finish status=failed exit_code={getattr(e, 'returncode', 'NA')} duration_seconds={elapsed}"
                 )
                 raise
             if proto_path is not None:
                 _status_log(f"phase=prototypes cutoff={pct} fold={fi+1} event=start")
+                proto_start = time.monotonic()
                 try:
                     run([
                         "python",
@@ -437,12 +559,14 @@ def main() -> None:
                         "--out",
                         str(proto_path),
                     ])
+                    elapsed = int(time.monotonic() - proto_start)
                     _status_log(
-                        f"phase=prototypes cutoff={pct} fold={fi+1} event=finish status=success path={proto_path}"
+                        f"phase=prototypes cutoff={pct} fold={fi+1} event=finish status=success path={proto_path} duration_seconds={elapsed}"
                     )
                 except subprocess.CalledProcessError as e:
+                    elapsed = int(time.monotonic() - proto_start)
                     _status_log(
-                        f"phase=prototypes cutoff={pct} fold={fi+1} event=finish status=failed exit_code={getattr(e, 'returncode', 'NA')}"
+                        f"phase=prototypes cutoff={pct} fold={fi+1} event=finish status=failed exit_code={getattr(e, 'returncode', 'NA')} duration_seconds={elapsed}"
                     )
                     raise
             if run_global and calibration_requested:
@@ -538,12 +662,15 @@ def main() -> None:
                         continue
                     print(f"[benchmark][eval] mode={label} cutoff={pct} fold={fi+1}")
                     _status_log(f"phase=eval cutoff={pct} fold={fi+1} mode={label} event=start")
+                    eval_start = time.monotonic()
                     try:
                         run(cmd)
-                        _status_log(f"phase=eval cutoff={pct} fold={fi+1} mode={label} event=finish status=success")
+                        elapsed = int(time.monotonic() - eval_start)
+                        _status_log(f"phase=eval cutoff={pct} fold={fi+1} mode={label} event=finish status=success duration_seconds={elapsed}")
                     except subprocess.CalledProcessError as e:
+                        elapsed = int(time.monotonic() - eval_start)
                         _status_log(
-                            f"phase=eval cutoff={pct} fold={fi+1} mode={label} event=finish status=failed exit_code={getattr(e, 'returncode', 'NA')}"
+                            f"phase=eval cutoff={pct} fold={fi+1} mode={label} event=finish status=failed exit_code={getattr(e, 'returncode', 'NA')} duration_seconds={elapsed}"
                         )
                         raise
             else:
@@ -802,4 +929,26 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit as exc:
+        code_obj = exc.code
+        if code_obj is None:
+            norm_code = 0
+        elif isinstance(code_obj, int):
+            norm_code = code_obj
+        else:
+            norm_code = 1
+        if norm_code != 0 and not _ABORT_STATE.get("pipeline_logged", False):
+            _status_log(f"pipeline event=python_exit status=failure exit_code={norm_code}")
+            _ABORT_STATE["pipeline_logged"] = True
+        raise
+    except Exception:
+        tb = traceback.format_exc()
+        _status_log("pipeline event=python_exception status=failure")
+        _ABORT_STATE["pipeline_logged"] = True
+        for line in tb.rstrip().splitlines():
+            if not line:
+                continue
+            _status_log(f"traceback python_exception line={json.dumps(line)}")
+        raise

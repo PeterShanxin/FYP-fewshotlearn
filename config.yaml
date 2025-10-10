@@ -74,7 +74,7 @@ sampler:
 eval:
   mode: global_support                     # new mode
   shortlist_topN: 200                      # optional prefilter for speed; 0 disables
-  temperature: 0.07
+  temperature: 0.5
   tau_multi: 0.35                          # global multi-label threshold
   # Toggles: whether evaluation should consume tuned parameters
   use_calibration: true                    # if true and calibration JSON exists, override tau/temperature
@@ -90,14 +90,14 @@ eval:
     # only: calibration-only, copies tau/temperature plots to results/figures and skips evaluation/visualization
     mode: produce                  # off | produce | only
     split: train                     # calibration split; train_cal/train/val/test
-    tau_range: [0.4, 0.8, 0.02]    # min, max, step for tau grid search
+    tau_range: [0.6, 0.95, 0.01]    # min, max, step for tau grid search
     opt_temp: bce                  # none | bce | brier
     shortlist_topN: 0              # override eval.shortlist_topN, null → reuse
     plot_all: false                # true → emit curves for micro/macro/acc
     plot_metric: micro_f1          # used when plot_all=false
     constraints:
-      min_precision: 0.20
-      min_recall: null
+      min_precision: 0.10
+      min_recall: 0.50
     per_ec:
       enable: false
       mode: max_f1
